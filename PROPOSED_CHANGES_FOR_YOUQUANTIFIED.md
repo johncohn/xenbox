@@ -100,7 +100,7 @@ cors: {
 ## Repos
 
 **Original YouQuantified repo:** https://github.com/mindhiveproject/You-Quantified/tree/old-backend
-**Our Pi fork:** https://github.com/johncohn/quantifiedYou_oldbackend_pi
+**Our Pi fork:** https://github.com/johncohn/xenbox
 
 Let me know what you think. Happy to help with PRs or refactoring whatever needs work.
 

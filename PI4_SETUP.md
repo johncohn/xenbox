@@ -42,21 +42,21 @@ sudo apt install -y git cmake build-essential
 ### Option A: Clone from GitHub (Recommended)
 ```bash
 cd ~
-git clone https://github.com/johncohn/quantifiedYou_oldbackend_pi.git
-cd quantifiedYou_oldbackend_pi
+git clone https://github.com/johncohn/xenbox.git
+cd xenbox
 ```
 
 ### Option B: Copy directly from your Mac
 On your Mac, run:
 ```bash
 # Copy from this directory to Pi 4
-scp -r /Users/jcohn/quantifiedYou_oldbackend_pi pi4-user@pi4-ip-address:~/
+scp -r /Users/jcohn/xenbox pi4-user@pi4-ip-address:~/
 ```
 
 ### Option C: Use rsync for efficient transfer
 ```bash
 rsync -avz --exclude 'node_modules' \
-  /Users/jcohn/quantifiedYou_oldbackend_pi/ \
+  /Users/jcohn/xenbox/ \
   pi4-user@pi4-ip-address:~/quantifiedYou_oldbackend_pi/
 ```
 
