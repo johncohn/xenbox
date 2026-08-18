@@ -215,8 +215,17 @@ let hasEEGData = false;    // True when Muse is sending data
 let midiStatusText = "MIDI: Not initialized";
 let encoderThreshold = 64;     // Knob 3 raw value (0-127): threshold offset for effect activation
 let activeEffect = 'Saturation';  // Default effect at power-up ('Chorus' or 'Saturation')
-let liveInput = false;             // false = tone generator, true = live audio input
-let inputCheckbox = null;          // DOM checkbox for Live Input toggle (assigned in setup())
+// Audio input source — one of INPUT_SOURCE_ORDER, cycled by the gain-knob button
+// or picked directly via the on-screen checkboxes. Live is the default so the
+// appliance is ready to process a real instrument the moment it powers up.
+const INPUT_SOURCES = {
+  Live:   { label: 'Live In',  cc: 1 },  // instrument through the Bela's live input
+  Tone:   { label: 'Tone',     cc: 0 },  // built-in test tone generator
+  Sample: { label: 'Sample',   cc: 2 }   // looping mikebass.wav recording on the Bela
+};
+const INPUT_SOURCE_ORDER = ['Live', 'Tone', 'Sample'];
+let inputSource = 'Live';
+const inputCheckboxes = {};        // DOM checkboxes for input-source selection (assigned in setup())
 let rawAlphaMidi = 0;              // Raw alpha activity 0-127 (pre-threshold, for histogram display)
 const sessionId = Date.now().toString(36) + Math.random().toString(36).substr(2, 5);  // Unique per page load
 let smoothedAlpha = 64;            // EMA-smoothed raw alpha (0-127), ~4 second time constant
@@ -227,19 +236,29 @@ let effectActive = false;          // True when EEG data flowing AND headset is 
 let ledSocket = null;
 let lastBelaStatus = null;  // Track last sent status to avoid redundant sends
 
-// Toggles between tone generator and live instrument input (MIDI CC9).
-// Shared by the on-screen checkbox and the encoder 1 (gain knob) button press,
-// so both stay in sync and the LED/MIDI/UI update the same way either time.
-function toggleLiveInput(forceValue) {
-  liveInput = (forceValue !== undefined) ? forceValue : !liveInput;
-  if (inputCheckbox) inputCheckbox.checked(liveInput);
-  sendMIDICC(MIDI_CONFIG.cc.inputSelect, liveInput ? 127 : 0);
-  console.log(`[INPUT] Source: ${liveInput ? 'Live Audio' : 'Tone Generator'}`);
+// Selects the audio input source (Live/Tone/Sample) and syncs the on-screen
+// checkboxes to match. Shared by the checkboxes' own click handler and the
+// gain-knob button, so both stay in sync the same way selectEffect() does.
+function setInputSource(key) {
+  if (!INPUT_SOURCES[key] || key === inputSource) return;
+  inputSource = key;
+  for (const otherKey of INPUT_SOURCE_ORDER) {
+    if (inputCheckboxes[otherKey]) inputCheckboxes[otherKey].checked(otherKey === key);
+  }
+  sendMIDICC(MIDI_CONFIG.cc.inputSelect, INPUT_SOURCES[key].cc);
+  console.log(`[INPUT] Source -> ${INPUT_SOURCES[key].label}`);
+}
+
+// Advances to the next input source in INPUT_SOURCE_ORDER, wrapping around
+function cycleInputSource() {
+  const idx = INPUT_SOURCE_ORDER.indexOf(inputSource);
+  const nextKey = INPUT_SOURCE_ORDER[(idx + 1) % INPUT_SOURCE_ORDER.length];
+  setInputSource(nextKey);
 }
 
 // Selects an effect by key and syncs the on-screen checkboxes to match.
 // Shared by the checkboxes' own click handler and the threshold-knob button,
-// so both stay in sync the same way toggleLiveInput() does for Live Input.
+// so both stay in sync the same way setInputSource() does for input source.
 function selectEffect(key) {
   if (!EFFECTS[key] || key === activeEffect) return;
   activeEffect = key;
@@ -295,8 +314,8 @@ function connectLEDSocket() {
             console.log(`[ENC] Threshold -> ${newThreshold}`);
           }
         } else if (msg.type === 'button_press' && msg.button === 'toggle_live_input') {
-          console.log('[ENC] Gain knob button -> toggling live input');
-          toggleLiveInput();
+          console.log('[ENC] Gain knob button -> next input source');
+          cycleInputSource();
         } else if (msg.type === 'button_press' && msg.button === 'cycle_effect') {
           console.log('[ENC] Threshold knob button -> next effect');
           cycleEffect();
@@ -501,8 +520,8 @@ function connectToMIDIOutput(output) {
       sendMIDICC(EFFECTS[key].mixCC, 0);
       sendMIDICC(EFFECTS[key].paramCC, MIDI_CONFIG.effectParams[key]);
     }
-    sendMIDICC(MIDI_CONFIG.cc.inputSelect, liveInput ? 127 : 0);
-    console.log("[MIDI] Sent parameters to Bela (default effect: " + activeEffect + ")");
+    sendMIDICC(MIDI_CONFIG.cc.inputSelect, INPUT_SOURCES[inputSource].cc);
+    console.log("[MIDI] Sent parameters to Bela (default effect: " + activeEffect + ", input: " + inputSource + ")");
   }, 500);
 }
 
@@ -615,13 +634,40 @@ function setup() {
     y += 25;
   }
 
-  // Audio input toggle checkbox
-  y += 10;  // Small gap after effect selection
-  inputCheckbox = createCheckbox("Live Input", false);
-  inputCheckbox.position(20, y);
-  inputCheckbox.changed(() => {
-    toggleLiveInput(inputCheckbox.checked());
-  });
+  // Input source selection — visually separated from the effect checkboxes
+  // above with a divider + label, since they're a different kind of control
+  y += 10;  // gap after effect selection
+  const inputDivider = createDiv();
+  inputDivider.position(20, y);
+  inputDivider.style('width', '150px');
+  inputDivider.style('border-top', '1px solid rgba(255,255,255,0.4)');
+  inputDivider.style('margin', '0');
+  y += 10;
+  const inputLabel = createP('INPUT SOURCE');
+  inputLabel.position(20, y);
+  inputLabel.style('color', '#aaa');
+  inputLabel.style('font-size', '11px');
+  inputLabel.style('letter-spacing', '1px');
+  inputLabel.style('margin', '0');
+  y += 20;
+
+  const inputOptions = INPUT_SOURCE_ORDER.map(key => ({ name: INPUT_SOURCES[key].label, key }));
+  for (let opt of inputOptions) {
+    const isDefault = (opt.key === inputSource);
+    const checkbox = createCheckbox(opt.name, isDefault);
+    checkbox.position(20, y);
+    checkbox.changed(() => {
+      // Radio behavior: only one active at a time
+      if (checkbox.checked()) {
+        setInputSource(opt.key);
+      } else {
+        // Don't allow unchecking the active one — recheck it
+        checkbox.checked(true);
+      }
+    });
+    inputCheckboxes[opt.key] = checkbox;
+    y += 25;
+  }
 
   // Initialize audio effects
   chorus = new Tone.Chorus({
@@ -1064,9 +1110,10 @@ function drawSignalPlots() {
 
 function drawMIDIHistogram() {
   const histX = 20;
-  // Below the effect checkboxes + Live Input checkbox (see setup(): start y=60,
-  // 25px per effect row, +10 gap, +25 for the Live Input row, +15 margin)
-  const histY = 60 + EFFECT_ORDER.length * 25 + 10 + 25 + 15;
+  // Below the effect checkboxes + input-source divider/label/checkboxes (see
+  // setup(): start y=60, 25px per effect row, +10 gap, +10 divider, +20 label,
+  // 25px per input-source row, +15 margin)
+  const histY = 60 + EFFECT_ORDER.length * 25 + 10 + 10 + 20 + INPUT_SOURCE_ORDER.length * 25 + 15;
   const histWidth = 240;
   const histHeight = height - histY - 20;
   const barPadding = 4;
