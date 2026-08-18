@@ -89,6 +89,13 @@ BRIGHTNESS = 64         # 25% brightness (64/255)
 ENCODER_I2C_ADDR = 0x49  # Default address for Adafruit Quad Encoder Breakout
 ENCODER_COUNT = 3
 ENCODER_INDICES = [1, 2, 3]  # 1=gain, 2=depth, 3=threshold
+
+# Per-encoder button pin, per Adafruit's own reference (NOT 12+n — non-sequential!):
+# https://learn.adafruit.com/adafruit-i2c-qt-rotary-encoder — encoders 0,1,2,3 -> pins 12,14,17,9
+# Previous code used `12 + enc_idx` (13,14,15 for slots 1,2,3), which silently read the
+# wrong pin for every slot: slot1 read an unconnected pin (always "released"), slot2 read
+# slot1's real button, and slot3 read an unconnected pin.
+BUTTON_PINS = {0: 12, 1: 14, 2: 17, 3: 9}
 SETTINGS_FILE = '/home/xenbox/encoder_settings.json'
 
 # Default encoder values (0-127 MIDI range)
@@ -140,7 +147,7 @@ class LEDController:
         self.stable_positions = [0] * ENCODER_COUNT  # Debounced positions
         self.stable_count = [0] * ENCODER_COUNT      # How many reads at same position
         self.button_was_pressed = [True] * ENCODER_COUNT  # Start True to debounce startup
-        self.button_cooldown = [0] * ENCODER_COUNT  # Cooldown counter to prevent rapid-fire
+        self.button_cooldown_until = [0.0] * ENCODER_COUNT  # Wall-clock time; ignore presses until this
         self.encoder_dead = [False] * ENCODER_COUNT  # Slots that hang on read
 
         # Connected WebSocket clients (for sending encoder values)
@@ -195,17 +202,27 @@ class LEDController:
         try:
             i2c = board.I2C()
             self.seesaw = Seesaw(i2c, addr=ENCODER_I2C_ADDR)
+
+            # Hardware reset before anything else. Without this, the chip's internal
+            # encoder counters can accumulate corrupted state over a long-running
+            # session (observed: slot3's position permanently frozen after some
+            # hours of use) that persists across our own process restarts since it
+            # lives on the seesaw chip, not in Python. A clean sw_reset() here fixed
+            # a real, reproducible freeze — confirmed by an isolated hardware test.
+            self.seesaw.sw_reset()
+            time.sleep(1.0)  # let the chip fully come back up before touching it
+
             product_id = (self.seesaw.get_version() >> 16) & 0xFFFF
-            print(f"[ENC] Seesaw product ID: {product_id}")
+            print(f"[ENC] Seesaw product ID: {product_id} (after sw_reset)")
 
             # Initialize encoders and buttons — button init MUST happen alongside
             # encoder init (DigitalIO configures seesaw pins needed by encoder module)
             # Init in REVERSE order to test if read-order affects first encoder
             for i, enc_idx in enumerate(ENCODER_INDICES):
                 enc = IncrementalEncoder(self.seesaw, encoder=enc_idx)
-                btn = DigitalIO(self.seesaw, pin=12 + enc_idx)  # Button pins: 12, 13, 14, 15
-                btn.switch_to_input(pull=digitalio.Pull.UP)  # Must use Pull.UP enum, not True
                 self.encoders.append(enc)
+                btn = DigitalIO(self.seesaw, pin=BUTTON_PINS[enc_idx])
+                btn.switch_to_input(pull=digitalio.Pull.UP)  # Must use Pull.UP enum, not True
                 self.buttons.append(btn)
                 # Do NOT read enc.position here — early reads may latch encoder in bad state
                 # last_positions stays at 0, first poll will pick up actual position
@@ -231,16 +248,19 @@ class LEDController:
         except Exception as e:
             print(f"[ENC] Error loading settings: {e}, using defaults")
 
-    def _save_encoder_settings(self):
-        """Save current encoder values to JSON file"""
+    def _save_encoder_settings(self, flash=True):
+        """Save current encoder values to JSON file. flash=False skips the
+        confirmation LED animation (~500ms) — used when a button press needs
+        to feel responsive, e.g. the live-input toggle."""
         try:
             with open(SETTINGS_FILE, 'w') as f:
                 json.dump(self.encoder_values, f, indent=2)
             print(f"[ENC] Saved settings to {SETTINGS_FILE}: {self.encoder_values}")
-            # Trigger LED flash to confirm save
-            with self.lock:
-                self.flash_save = True
-                self.flash_counter = 0
+            if flash:
+                # Trigger LED flash to confirm save
+                with self.lock:
+                    self.flash_save = True
+                    self.flash_counter = 0
         except Exception as e:
             print(f"[ENC] Error saving settings: {e}")
 
@@ -303,6 +323,9 @@ class LEDController:
             self._poll_count = 0
             self._enc_read_errors = [0, 0, 0]
             self._enc_read_ok = [0, 0, 0]
+            self._btn_read_errors = [0, 0, 0]
+            self._btn_read_ok = [0, 0, 0]
+            self._btn_last_raw = [None, None, None]
         self._poll_count += 1
 
         # Log all encoder status every ~5 seconds (300 polls at 60Hz)
@@ -311,7 +334,10 @@ class LEDController:
             for i in range(ENCODER_COUNT):
                 slot = ENCODER_INDICES[i]
                 dead = " DEAD" if self.encoder_dead[i] else ""
-                status.append(f"slot{slot}(ok={self._enc_read_ok[i]} err={self._enc_read_errors[i]} pos={self.last_positions[i]}{dead})")
+                status.append(
+                    f"slot{slot}(ok={self._enc_read_ok[i]} err={self._enc_read_errors[i]} pos={self.last_positions[i]}{dead} "
+                    f"btn_ok={self._btn_read_ok[i]} btn_err={self._btn_read_errors[i]} btn_raw={self._btn_last_raw[i]})"
+                )
             print(f"[ENC] poll#{self._poll_count}: {' | '.join(status)}")
 
         try:
@@ -358,19 +384,41 @@ class LEDController:
                             self._autosave_dirty = True
                             self._autosave_time = time.time() + 5.0  # save 5s after last turn
 
-                # Read button (active low) — debounce + cooldown
+                # Read button (active low) — debounce + cooldown (wall-clock time, not poll
+                # count — actual poll rate depends on I2C transaction latency at this board's
+                # 50kHz bus speed, so a fixed poll-count cooldown stretched out unpredictably,
+                # up to 20-30s in practice instead of the intended ~0.5s)
+                if self.buttons[i] is None:
+                    continue  # slot3 — button intentionally not read, see _init_encoders
                 try:
-                    if self.button_cooldown[i] > 0:
-                        self.button_cooldown[i] -= 1
+                    raw_val = self.buttons[i].value
+                    self._btn_read_ok[i] += 1
+                    self._btn_last_raw[i] = raw_val
+                    now = time.time()
+                    if now < self.button_cooldown_until[i]:
+                        pass  # still in cooldown, ignore this read
                     else:
-                        pressed = not self.buttons[i].value
+                        pressed = not raw_val
                         if pressed and not self.button_was_pressed[i]:
                             print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) pressed - saving settings")
-                            self._save_encoder_settings()
-                            self.button_cooldown[i] = 60  # ~1 sec cooldown at 60Hz
+                            # Skip the save-confirmation flash on buttons that also drive a
+                            # browser action — it adds ~500ms and those already give fast,
+                            # visible feedback of their own
+                            self._save_encoder_settings(flash=(i not in (0, 2)))
+                            if i == 0:
+                                # Gain knob (slot 1) button also toggles live input on the browser
+                                print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling live input")
+                                self._broadcast_button_event('toggle_live_input')
+                            elif i == 2:
+                                # Threshold knob (slot 3) button cycles to the next effect
+                                print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - cycling effect")
+                                self._broadcast_button_event('cycle_effect')
+                            self.button_cooldown_until[i] = now + 0.2  # 200ms real debounce
                         self.button_was_pressed[i] = pressed
-                except Exception:
-                    pass  # Button read failed, skip
+                except Exception as btn_err:
+                    self._btn_read_errors[i] += 1
+                    if self._btn_read_errors[i] <= 5 or self._btn_read_errors[i] % 300 == 0:
+                        print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) read error #{self._btn_read_errors[i]}: {btn_err}")
 
         except Exception as e:
             print(f"[ENC] Poll error: {e}")
@@ -400,6 +448,20 @@ class LEDController:
                 asyncio.run_coroutine_threadsafe(ws.send(message), self._loop)
             except Exception as e:
                 print(f"[ENC] Broadcast error: {e}")
+                disconnected.add(ws)
+        self.ws_clients -= disconnected
+
+    def _broadcast_button_event(self, button_name):
+        """Send a one-shot button-press event to all connected WebSocket clients."""
+        if not self.ws_clients:
+            return
+        message = json.dumps({'type': 'button_press', 'button': button_name})
+        disconnected = set()
+        for ws in self.ws_clients:
+            try:
+                asyncio.run_coroutine_threadsafe(ws.send(message), self._loop)
+            except Exception as e:
+                print(f"[ENC] Button broadcast error: {e}")
                 disconnected.add(ws)
         self.ws_clients -= disconnected
 
