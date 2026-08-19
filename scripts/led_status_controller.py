@@ -97,6 +97,7 @@ ENCODER_INDICES = [1, 2, 3]  # 1=gain, 2=depth, 3=threshold
 # slot1's real button, and slot3 read an unconnected pin.
 BUTTON_PINS = {0: 12, 1: 14, 2: 17, 3: 9}
 SETTINGS_FILE = '/home/xenbox/encoder_settings.json'
+LONG_PRESS_SECONDS = 3.0  # hold any encoder button this long to trigger encoder recovery
 
 # Default encoder values (0-127 MIDI range)
 DEFAULT_ENCODER_VALUES = {
@@ -148,6 +149,8 @@ class LEDController:
         self.stable_count = [0] * ENCODER_COUNT      # How many reads at same position
         self.button_was_pressed = [True] * ENCODER_COUNT  # Start True to debounce startup
         self.button_cooldown_until = [0.0] * ENCODER_COUNT  # Wall-clock time; ignore presses until this
+        self.button_press_start = [None] * ENCODER_COUNT  # Wall-clock time the current press began
+        self.button_long_press_fired = [False] * ENCODER_COUNT  # Recovery already triggered this press
         self.encoder_dead = [False] * ENCODER_COUNT  # Slots that hang on read
 
         # Connected WebSocket clients (for sending encoder values)
@@ -233,6 +236,45 @@ class LEDController:
             self.seesaw = None
             self.encoders = []
             self.buttons = []
+
+    def _recover_encoders(self):
+        """Full seesaw sw_reset() + reinitialize encoders/buttons in place, without
+        restarting the whole service. Triggered by holding any encoder button for
+        LONG_PRESS_SECONDS — the chip's internal encoder counters can accumulate
+        corrupted state during a long-running session (observed: a slot's position
+        permanently frozen despite clean reads), and this lets you recover from
+        that at the device itself, no laptop/SSH needed."""
+        if self.seesaw is None:
+            print("[ENC] Recovery skipped — no seesaw connection")
+            return
+        print("[ENC] Recovery: sw_reset + reinitializing encoders...")
+        try:
+            self.seesaw.sw_reset()
+            time.sleep(1.0)  # let the chip fully come back up before touching it
+            new_encoders = []
+            new_buttons = []
+            for enc_idx in ENCODER_INDICES:
+                enc = IncrementalEncoder(self.seesaw, encoder=enc_idx)
+                btn = DigitalIO(self.seesaw, pin=BUTTON_PINS[enc_idx])
+                btn.switch_to_input(pull=digitalio.Pull.UP)
+                new_encoders.append(enc)
+                new_buttons.append(btn)
+            self.encoders = new_encoders
+            self.buttons = new_buttons
+            # Reset tracking so the next poll doesn't see a spurious jump/press
+            self.last_positions = [0] * ENCODER_COUNT
+            self.stable_positions = [0] * ENCODER_COUNT
+            self.stable_count = [0] * ENCODER_COUNT
+            self.button_was_pressed = [True] * ENCODER_COUNT
+            self.button_press_start = [None] * ENCODER_COUNT
+            self.button_long_press_fired = [False] * ENCODER_COUNT
+            self.button_cooldown_until = [time.time() + 1.0] * ENCODER_COUNT
+            print("[ENC] Recovery complete")
+            with self.lock:
+                self.flash_save = True
+                self.flash_counter = 0
+        except Exception as e:
+            print(f"[ENC] Recovery FAILED: {e}")
 
     def _load_encoder_settings(self):
         """Load saved encoder values from JSON file"""
@@ -395,10 +437,26 @@ class LEDController:
                     self._btn_read_ok[i] += 1
                     self._btn_last_raw[i] = raw_val
                     now = time.time()
+                    pressed = not raw_val
+
+                    # Long-press-and-hold recovery gesture — checked independently of
+                    # the cooldown gate below, so holding still works even right after
+                    # this same press already fired its normal short-press action.
+                    if pressed:
+                        if self.button_press_start[i] is None:
+                            self.button_press_start[i] = now
+                            self.button_long_press_fired[i] = False
+                        elif not self.button_long_press_fired[i] and (now - self.button_press_start[i]) >= LONG_PRESS_SECONDS:
+                            self.button_long_press_fired[i] = True
+                            print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) held {LONG_PRESS_SECONDS}s - recovering encoders")
+                            self._recover_encoders()
+                            return changed  # encoders/buttons were just replaced — resume next poll cycle
+                    else:
+                        self.button_press_start[i] = None
+
                     if now < self.button_cooldown_until[i]:
                         pass  # still in cooldown, ignore this read
                     else:
-                        pressed = not raw_val
                         if pressed and not self.button_was_pressed[i]:
                             print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) pressed - saving settings")
                             # Skip the save-confirmation flash on buttons that also drive a
