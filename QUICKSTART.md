@@ -55,10 +55,16 @@ You don't need to touch the Pi directly. From a Mac on the same network (or tunn
 Tunnels ports 3000/3001/8765 and opens the kiosk dashboard in Chrome at `localhost:3000`. You'll see the live EEG plots, MIDI status, and effect selector — everything except Muse Bluetooth, which stays paired to the Pi's own Chromium (from a Mac browser you'll see a "Connect Muse" button but it won't activate).
 
 ### Mirror the Pi's actual screen (VNC)
+
+**Normal way:** open RealVNC Viewer and connect directly to `xenbox.local` — no tunnel needed on the local network.
+
+**Fallback (e.g. off the local network):** tunnel VNC over SSH instead:
 ```bash
 ssh -L 5900:localhost:5900 -N xenbox@xenbox.local
 ```
-Then connect a VNC client to `vnc://localhost:5900` (Mac: Finder → Go → Connect to Server). This shows exactly what's on the kiosk display, including anything you interact with via mouse/touch.
+Then connect a VNC client to `vnc://localhost:5900` (Mac: Finder → Go → Connect to Server).
+
+Either way, this shows exactly what's on the kiosk display, including anything you interact with via mouse/touch.
 
 ### Read the browser's JavaScript console (for debugging signal values, MIDI sends, etc.)
 ```bash

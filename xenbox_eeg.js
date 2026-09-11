@@ -215,6 +215,26 @@ let hasEEGData = false;    // True when Muse is sending data
 let midiStatusText = "MIDI: Not initialized";
 let encoderThreshold = 64;     // Knob 3 raw value (0-127): threshold offset for effect activation
 let activeEffect = 'Saturation';  // Default effect at power-up ('Chorus' or 'Saturation')
+
+// Autotrack — optional mode that slowly repositions the threshold (knob 3) to
+// compensate for the alpha baseline drifting over a session, so the effect
+// doesn't get stuck fully on or fully off as your overall relaxation level
+// wanders. On by default (toggle with the depth-knob button, or its
+// checkbox) — pure manual threshold control if you turn it off.
+// When stuck in the same on/off state past graceSeconds, the threshold
+// creeps toward (current alpha ± margin) — just past the boundary on
+// whichever side you're stuck on — at trackingRate per frame, so it's a
+// slow correction, not a jump. A manual knob turn always overrides it
+// immediately and resets the grace period (see the encoder_values handler).
+const AUTOTRACK_CONFIG = {
+  graceSeconds: 3,       // how long stuck in the same state before correction starts
+  trackingRate: 0.011,   // per-frame chase rate toward the target (~1.5s to mostly converge)
+  margin: 10             // how far past the boundary to park the threshold (0-127 units)
+};
+let autotrackEnabled = true;   // ON by default — matches the field finding that manual thresholds drift
+let autotrackStateOn = false;   // last known on/off state, for detecting a flip
+let autotrackDwellFrames = 0;   // consecutive frames spent in the same state
+let autotrackCheckbox = null;   // DOM checkbox, assigned in setup()
 // Audio input source — one of INPUT_SOURCE_ORDER, cycled by the gain-knob button
 // or picked directly via the on-screen checkboxes. Live is the default so the
 // appliance is ready to process a real instrument the moment it powers up.
@@ -247,6 +267,16 @@ function setInputSource(key) {
   }
   sendMIDICC(MIDI_CONFIG.cc.inputSelect, INPUT_SOURCES[key].cc);
   console.log(`[INPUT] Source -> ${INPUT_SOURCES[key].label}`);
+}
+
+// Toggles Autotrack mode on/off (see AUTOTRACK_CONFIG above). Shared by its
+// own checkbox and the depth-knob (middle, slot 2) button press.
+function toggleAutotrack(forceValue) {
+  autotrackEnabled = (forceValue !== undefined) ? forceValue : !autotrackEnabled;
+  if (autotrackCheckbox) autotrackCheckbox.checked(autotrackEnabled);
+  autotrackDwellFrames = 0;
+  autotrackStateOn = smoothedAlpha > encoderThreshold;
+  console.log(`[AUTOTRACK] ${autotrackEnabled ? 'ON' : 'OFF'}`);
 }
 
 // Advances to the next input source in INPUT_SOURCE_ORDER, wrapping around
@@ -307,10 +337,13 @@ function connectLEDSocket() {
             }
           }
 
-          // Knob 3: Threshold — controls effect activation offset
+          // Knob 3: Threshold — controls effect activation offset.
+          // A manual turn always wins over Autotrack's drift and gives it a
+          // fresh grace period, rather than fighting the physical knob.
           const newThreshold = Math.max(0, Math.min(127, Math.round(msg.threshold)));
-          if (newThreshold !== encoderThreshold) {
+          if (newThreshold !== Math.round(encoderThreshold)) {
             encoderThreshold = newThreshold;
+            autotrackDwellFrames = 0;
             console.log(`[ENC] Threshold -> ${newThreshold}`);
           }
         } else if (msg.type === 'button_press' && msg.button === 'toggle_live_input') {
@@ -319,6 +352,9 @@ function connectLEDSocket() {
         } else if (msg.type === 'button_press' && msg.button === 'cycle_effect') {
           console.log('[ENC] Threshold knob button -> next effect');
           cycleEffect();
+        } else if (msg.type === 'button_press' && msg.button === 'toggle_autotrack') {
+          console.log('[ENC] Depth knob button -> toggling Autotrack');
+          toggleAutotrack();
         }
       } catch (e) {
         // Ignore parse errors on incoming messages
@@ -669,6 +705,16 @@ function setup() {
     y += 25;
   }
 
+  // Autotrack — independent toggle, NOT part of the source radio group above
+  // (it's a threshold-behavior mode, not an audio source, so it can be on
+  // at the same time as any of Live/Tone/Sample without changing playback)
+  autotrackCheckbox = createCheckbox("Autotrack", autotrackEnabled);
+  autotrackCheckbox.position(20, y);
+  autotrackCheckbox.changed(() => {
+    toggleAutotrack(autotrackCheckbox.checked());
+  });
+  y += 25;
+
   // Initialize audio effects
   chorus = new Tone.Chorus({
     frequency: 1.5,
@@ -808,6 +854,27 @@ function draw() {
   const smoothK = 0.008;
   smoothedAlpha += smoothK * (rawAlphaMidi - smoothedAlpha);
 
+  // Autotrack: if enabled, slowly reposition the threshold when it's been
+  // stuck fully on or fully off for a while (see AUTOTRACK_CONFIG above).
+  if (autotrackEnabled) {
+    const isOn = smoothedAlpha > encoderThreshold;
+    if (isOn !== autotrackStateOn) {
+      autotrackStateOn = isOn;
+      autotrackDwellFrames = 0;
+    } else {
+      autotrackDwellFrames++;
+    }
+    const graceFrames = AUTOTRACK_CONFIG.graceSeconds * 60;
+    if (autotrackDwellFrames > graceFrames) {
+      // Stuck off -> chase just above current alpha; stuck on -> chase just below
+      const target = isOn
+        ? smoothedAlpha - AUTOTRACK_CONFIG.margin
+        : smoothedAlpha + AUTOTRACK_CONFIG.margin;
+      encoderThreshold += AUTOTRACK_CONFIG.trackingRate * (target - encoderThreshold);
+      encoderThreshold = Math.max(0, Math.min(127, encoderThreshold));
+    }
+  }
+
   // Threshold gate applied AFTER smoothing
   // Effect intensity proportional to how far smoothed alpha exceeds threshold
   const thresholdMidi = encoderThreshold;  // Knob 3 raw value 0-127
@@ -936,7 +1003,7 @@ function draw() {
   // Values
   textSize(18);
   fill(255);
-  text(`GAIN:${MIDI_CONFIG.fixedValues.gain}  ${knob2Label}:${knob2Value}  THR:${encoderThreshold}`, encX + 10, encY + 35);
+  text(`GAIN:${MIDI_CONFIG.fixedValues.gain}  ${knob2Label}:${knob2Value}  THR:${Math.round(encoderThreshold)}${autotrackEnabled ? ' AT' : ''}`, encX + 10, encY + 35);
 
   // Show threshold status: effect active or inactive
   const thresholdActive = chorus_wetVal > 0.1;
@@ -1110,10 +1177,10 @@ function drawSignalPlots() {
 
 function drawMIDIHistogram() {
   const histX = 20;
-  // Below the effect checkboxes + input-source divider/label/checkboxes (see
-  // setup(): start y=60, 25px per effect row, +10 gap, +10 divider, +20 label,
-  // 25px per input-source row, +15 margin)
-  const histY = 60 + EFFECT_ORDER.length * 25 + 10 + 10 + 20 + INPUT_SOURCE_ORDER.length * 25 + 15;
+  // Below the effect checkboxes + input-source divider/label/checkboxes +
+  // Autotrack checkbox (see setup(): start y=60, 25px per effect row, +10 gap,
+  // +10 divider, +20 label, 25px per input-source row, +25 Autotrack row, +15 margin)
+  const histY = 60 + EFFECT_ORDER.length * 25 + 10 + 10 + 20 + INPUT_SOURCE_ORDER.length * 25 + 25 + 15;
   const histWidth = 240;
   const histHeight = height - histY - 20;
   const barPadding = 4;

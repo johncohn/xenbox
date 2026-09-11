@@ -462,11 +462,15 @@ class LEDController:
                             # Skip the save-confirmation flash on buttons that also drive a
                             # browser action — it adds ~500ms and those already give fast,
                             # visible feedback of their own
-                            self._save_encoder_settings(flash=(i not in (0, 2)))
+                            self._save_encoder_settings(flash=(i not in (0, 1, 2)))
                             if i == 0:
                                 # Gain knob (slot 1) button also toggles live input on the browser
                                 print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling live input")
                                 self._broadcast_button_event('toggle_live_input')
+                            elif i == 1:
+                                # Depth knob (slot 2) button toggles Autotrack mode on the browser
+                                print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling autotrack")
+                                self._broadcast_button_event('toggle_autotrack')
                             elif i == 2:
                                 # Threshold knob (slot 3) button cycles to the next effect
                                 print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - cycling effect")
