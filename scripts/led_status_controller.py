@@ -10,7 +10,9 @@ Communicates bidirectionally with the browser via WebSocket.
 LED Layout:
 - LED 0: GREEN when system ready, RED when bypass (GPIO17 grounded)
 - LED 1: PURPLE when Muse connected, PURPLE pulse when streaming + worn
-- LED 2: AQUA proportional to effect mix (when streaming + worn)
+- LED 2: subtle slow YELLOW pulse while the browser's drift-tracking EMAs are
+  still converging (don't set the threshold yet); AQUA proportional to effect
+  mix once ready (when streaming + worn)
 
 Encoder Layout (Adafruit Quad Encoder Breakout, I2C addr 0x49):
 - Encoder 0: Chorus gain (CC5, 0-127, default 100)
@@ -130,6 +132,12 @@ class LEDController:
         self.muse_state = ConnectionState.STARTUP  # LED 1: Muse connection
         self.wet_value = 0.0             # Effect mix value (0-1), same signal as audio
         self.is_worn = False             # Whether headband is on head
+        self.drift_ready = True          # False while the browser's drift-tracking EMAs
+                                          # are still converging — LED 2 pulses yellow
+                                          # instead of showing aqua wet-value while this
+                                          # is False, so the threshold isn't set against
+                                          # a moving target. Defaults True so an older
+                                          # blob version (no 'ready' field) behaves as before.
 
         # Blink state for connecting animation
         self.blink_state = False
@@ -328,6 +336,12 @@ class LEDController:
         """Set effect mix value (0-1) for blue LED — same value driving the audio."""
         self.wet_value = max(0.0, min(1.0, wet))
 
+    def set_drift_ready(self, ready: bool):
+        with self.lock:
+            if self.drift_ready != ready:
+                print(f"[LED] Drift-tracking ready: {self.drift_ready} -> {ready}")
+                self.drift_ready = ready
+
     def _read_bypass_gpio(self):
         """Read bypass GPIO — returns True if grounded (bypass active)."""
         try:
@@ -468,8 +482,10 @@ class LEDController:
                                 print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling live input")
                                 self._broadcast_button_event('toggle_live_input')
                             elif i == 1:
-                                # Depth knob (slot 2) button toggles Autotrack mode on the browser
-                                print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling autotrack")
+                                # Depth knob (slot 2) button toggles Drift Fix on the browser
+                                # (message name kept as 'toggle_autotrack' — it's the successor
+                                # to the old Autotrack mechanism, wire protocol unchanged)
+                                print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling drift fix")
                                 self._broadcast_button_event('toggle_autotrack')
                             elif i == 2:
                                 # Threshold knob (slot 3) button cycles to the next effect
@@ -534,6 +550,7 @@ class LEDController:
                 muse_state = self.muse_state
                 is_worn = self.is_worn
                 flash_save = self.flash_save
+                drift_ready = self.drift_ready
             # Read wet value outside lock — set from async WebSocket handler
             wet_value = self.wet_value
 
@@ -587,10 +604,21 @@ class LEDController:
                 elif muse_state in (ConnectionState.STREAMING, ConnectionState.CONNECTED):
                     led1_r, led1_g, led1_b = BRIGHTNESS, 0, BRIGHTNESS  # PURPLE solid
 
-                # LED 2: AQUA — directly mirrors effect wet value (0-1)
-                # xenbox_eeg.js already zeros wet when not worn or no EEG data
-                mix_br = int(wet_value * BRIGHTNESS)
-                led2_r, led2_g, led2_b = 0, mix_br, int(mix_br * 0.8)  # AQUA (green + blue)
+                # LED 2: AQUA — directly mirrors effect wet value (0-1) once the
+                # browser's drift-tracking EMAs have converged. Before that, a
+                # subtle slow yellow pulse signals "don't set the threshold yet —
+                # still training" rather than showing a wet value that's being
+                # measured against a moving baseline.
+                if not drift_ready:
+                    pulse = (math.sin(time.time() * 2 * math.pi / 6.0) + 1) / 2  # 0-1 over 6s, slower than LED1's
+                    gamma_pulse = pulse ** 2.2
+                    subtle_max = max(1, BRIGHTNESS // 3)  # deliberately low — "subtle", not attention-grabbing
+                    br = int(1 + gamma_pulse * (subtle_max - 1))
+                    led2_r, led2_g, led2_b = br, br, 0  # YELLOW pulse (red + green)
+                else:
+                    # xenbox_eeg.js already zeros wet when not worn or no EEG data
+                    mix_br = int(wet_value * BRIGHTNESS)
+                    led2_r, led2_g, led2_b = 0, mix_br, int(mix_br * 0.8)  # AQUA (green + blue)
 
                 if self.neo:
                     self.neo.set_led_color(0, led0_g, led0_r, led0_b)  # swap r/g for RGB LEDs
@@ -666,6 +694,8 @@ async def handle_websocket(websocket, path=None):
                     led.set_bela_connected(connected)
 
                 elif msg_type == 'alpha_score':
+                    if 'ready' in data:
+                        led.set_drift_ready(bool(data['ready']))
                     if 'wet' in data:
                         # New format: direct wet value (0-1)
                         led.set_wet_value(data['wet'])

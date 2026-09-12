@@ -153,7 +153,7 @@ const MIDI_CONFIG = {
     sweep: 6,              // CC6: Auto-sweep toggle (0=off, 127=on)
     satMix: 7,             // CC7: Saturation wet/dry mix (0-1) - controlled by Alpha
     satDrive: 8,           // CC8: Saturation drive amount (maps to 1-10 in PD)
-    inputSelect: 9,        // CC9: Input source (0=tone generator, 127=live audio input)
+    inputSelect: 9,        // CC9: Input source (0=Tone, 1=Live, 2=Sample/mikebass, 3=Airport, 4=Zone)
     autopanMix: 10,        // CC10: Auto-Pan wet/dry mix (0-1) - controlled by Alpha
     autopanRate: 11,       // CC11: Auto-Pan LFO rate
     tremoloMix: 12,        // CC12: Tremolo wet/dry mix (0-1) - controlled by Alpha
@@ -216,34 +216,74 @@ let midiStatusText = "MIDI: Not initialized";
 let encoderThreshold = 64;     // Knob 3 raw value (0-127): threshold offset for effect activation
 let activeEffect = 'Saturation';  // Default effect at power-up ('Chorus' or 'Saturation')
 
-// Autotrack — optional mode that slowly repositions the threshold (knob 3) to
-// compensate for the alpha baseline drifting over a session, so the effect
-// doesn't get stuck fully on or fully off as your overall relaxation level
-// wanders. On by default (toggle with the depth-knob button, or its
-// checkbox) — pure manual threshold control if you turn it off.
-// When stuck in the same on/off state past graceSeconds, the threshold
-// creeps toward (current alpha ± margin) — just past the boundary on
-// whichever side you're stuck on — at trackingRate per frame, so it's a
-// slow correction, not a jump. A manual knob turn always overrides it
-// immediately and resets the grace period (see the encoder_values handler).
-const AUTOTRACK_CONFIG = {
-  graceSeconds: 3,       // how long stuck in the same state before correction starts
-  trackingRate: 0.011,   // per-frame chase rate toward the target (~1.5s to mostly converge)
-  margin: 10             // how far past the boundary to park the threshold (0-127 units)
+// Drift Fix — replaces the earlier "Autotrack" approach (which moved the
+// threshold itself, and on reflection risked manufacturing crossings rather
+// than just removing drift). Per Greg Appelbaum's suggestion: keep the
+// threshold FIXED, and instead remove the drift from the signal before it
+// ever reaches the comparator. Track alpha with two EMAs — fast and slow —
+// and use their difference as the tracked value. Slow baseline drift moves
+// both EMAs together and cancels out in the subtraction; a genuine, faster
+// state change shows up in the fast EMA before the slow one catches up, so
+// it still registers cleanly. Toggle with the depth-knob button (or its
+// checkbox) for A/B comparison against the legacy lifetime-mean approach —
+// both are always computed every frame (see draw()) so the drift-tracking
+// plot can show both traces regardless of which one is currently driving
+// the effect. On by default.
+const DRIFT_CONFIG = {
+  fastSeconds: 7.5,   // fast EMA time constant — tracks near-term alpha
+  slowSeconds: 240,   // slow EMA time constant — tracks the drifting baseline.
+                       // Bumped 120->240 (2min->4min) — a controlled steady-state
+                       // test at 120s showed a multi-minute residual arc in the
+                       // "corrected" trace, evidence 120s wasn't slow enough to
+                       // fully absorb it. Greg's suggested range was 2-5 min.
+  deadband: 8,         // ON/OFF hysteresis width around the threshold (0-127 units),
+                       // prevents flicker right at the boundary
+  readySeconds: 480    // how long the slow EMA needs to run before it's considered
+                       // converged enough to trust for setting the threshold —
+                       // 2x slowSeconds is a reasonable rule of thumb.
+                       // Tried cutting to 1x (240) to shorten the "training" wait,
+                       // reverted: a several-minute live trace showed persistent
+                       // minute-scale wander in the drift-corrected signal even at
+                       // the original 480 — readySeconds isn't the cause (it only
+                       // gates when we trust the value, not whether fast-slow EMA
+                       // subtraction actually removes this kind of movement — it
+                       // doesn't; only much-slower-than-slowSeconds drift cancels).
+                       // Shortening it would just mean trusting the still-wandering
+                       // value sooner. Root cause is unresolved — see whether that
+                       // 1-4min wander is real alpha-state signal or artifact before
+                       // touching this again.
 };
-let autotrackEnabled = true;   // ON by default — matches the field finding that manual thresholds drift
-let autotrackStateOn = false;   // last known on/off state, for detecting a flip
-let autotrackDwellFrames = 0;   // consecutive frames spent in the same state
-let autotrackCheckbox = null;   // DOM checkbox, assigned in setup()
+let driftFixEnabled = true;    // ON by default
+let fastEMA_alpha = null;      // null = not yet seeded (seeded from first real sample)
+let slowEMA_alpha = null;
+let driftStartTime = null;     // performance.now() at first seed — for the readiness clock.
+                                // Not reset by the A/B toggle (both EMAs always run
+                                // regardless of which one is driving audio), only by a
+                                // fresh Muse connection (see hasEEGData transition below)
+let smoothedAlphaLegacy = 64;  // "A" — old lifetime-mean-based tracked value
+let smoothedAlphaDrift = 64;   // "B" — new fast/slow-diff-based tracked value
+let effectOnState = false;     // hysteresis on/off state machine
+let driftCheckbox = null;      // DOM checkbox, assigned in setup()
+
+// Rolling history for the drift-tracking plot — sampled once/sec (not every
+// frame) so a modest buffer covers a genuinely useful multi-minute window
+const DRIFT_HISTORY_LENGTH = 600;  // 600 samples @ 1/sec = 10 minutes — covers
+                                    // the full readySeconds convergence window
+                                    // plus several minutes of margin
+let driftHistoryLegacy = [];
+let driftHistoryDrift = [];
+let lastDriftSampleTime = 0;
 // Audio input source — one of INPUT_SOURCE_ORDER, cycled by the gain-knob button
 // or picked directly via the on-screen checkboxes. Live is the default so the
 // appliance is ready to process a real instrument the moment it powers up.
 const INPUT_SOURCES = {
-  Live:   { label: 'Live In',  cc: 1 },  // instrument through the Bela's live input
-  Tone:   { label: 'Tone',     cc: 0 },  // built-in test tone generator
-  Sample: { label: 'Sample',   cc: 2 }   // looping mikebass.wav recording on the Bela
+  Live:    { label: 'Live In',  cc: 1 },  // instrument through the Bela's live input
+  Tone:    { label: 'Tone',     cc: 0 },  // built-in test tone generator
+  Sample:  { label: 'Sample',   cc: 2 },  // looping mikebass.wav recording on the Bela
+  Airport: { label: 'Airport',  cc: 3 },  // looping airports.wav recording on the Bela
+  Zone:    { label: 'Zone',     cc: 4 }   // looping zone.wav recording on the Bela
 };
-const INPUT_SOURCE_ORDER = ['Live', 'Tone', 'Sample'];
+const INPUT_SOURCE_ORDER = ['Live', 'Tone', 'Sample', 'Airport', 'Zone'];
 let inputSource = 'Live';
 const inputCheckboxes = {};        // DOM checkboxes for input-source selection (assigned in setup())
 let rawAlphaMidi = 0;              // Raw alpha activity 0-127 (pre-threshold, for histogram display)
@@ -269,14 +309,14 @@ function setInputSource(key) {
   console.log(`[INPUT] Source -> ${INPUT_SOURCES[key].label}`);
 }
 
-// Toggles Autotrack mode on/off (see AUTOTRACK_CONFIG above). Shared by its
-// own checkbox and the depth-knob (middle, slot 2) button press.
-function toggleAutotrack(forceValue) {
-  autotrackEnabled = (forceValue !== undefined) ? forceValue : !autotrackEnabled;
-  if (autotrackCheckbox) autotrackCheckbox.checked(autotrackEnabled);
-  autotrackDwellFrames = 0;
-  autotrackStateOn = smoothedAlpha > encoderThreshold;
-  console.log(`[AUTOTRACK] ${autotrackEnabled ? 'ON' : 'OFF'}`);
+// Toggles Drift Fix on/off — A/B switch between the legacy lifetime-mean
+// tracked signal and the new fast/slow-EMA drift-corrected one (see
+// DRIFT_CONFIG above). Shared by its own checkbox and the depth-knob
+// (middle, slot 2) button press.
+function toggleDriftFix(forceValue) {
+  driftFixEnabled = (forceValue !== undefined) ? forceValue : !driftFixEnabled;
+  if (driftCheckbox) driftCheckbox.checked(driftFixEnabled);
+  console.log(`[DRIFT FIX] ${driftFixEnabled ? 'ON' : 'OFF'}`);
 }
 
 // Advances to the next input source in INPUT_SOURCE_ORDER, wrapping around
@@ -337,13 +377,12 @@ function connectLEDSocket() {
             }
           }
 
-          // Knob 3: Threshold — controls effect activation offset.
-          // A manual turn always wins over Autotrack's drift and gives it a
-          // fresh grace period, rather than fighting the physical knob.
+          // Knob 3: Threshold — controls effect activation offset. Fixed
+          // now (no more Autotrack-style chasing) — Drift Fix corrects the
+          // signal instead, so a manual turn just sets it directly.
           const newThreshold = Math.max(0, Math.min(127, Math.round(msg.threshold)));
           if (newThreshold !== Math.round(encoderThreshold)) {
             encoderThreshold = newThreshold;
-            autotrackDwellFrames = 0;
             console.log(`[ENC] Threshold -> ${newThreshold}`);
           }
         } else if (msg.type === 'button_press' && msg.button === 'toggle_live_input') {
@@ -353,8 +392,10 @@ function connectLEDSocket() {
           console.log('[ENC] Threshold knob button -> next effect');
           cycleEffect();
         } else if (msg.type === 'button_press' && msg.button === 'toggle_autotrack') {
-          console.log('[ENC] Depth knob button -> toggling Autotrack');
-          toggleAutotrack();
+          // Wire message name kept as-is (Python side unchanged) — this now
+          // toggles Drift Fix, the successor to the old Autotrack mechanism
+          console.log('[ENC] Depth knob button -> toggling Drift Fix');
+          toggleDriftFix();
         }
       } catch (e) {
         // Ignore parse errors on incoming messages
@@ -385,11 +426,13 @@ function sendBelaStatus(connected) {
   }
 }
 
-function sendAlphaScore(wetVal) {
-  // Send the exact effect mix value (0-1) to LED controller for blue LED
+function sendAlphaScore(wetVal, ready) {
+  // Send the exact effect mix value (0-1) to LED controller for the aqua LED,
+  // plus whether the drift-tracking EMAs have converged enough to trust for
+  // setting the threshold (LED 2 pulses yellow instead of aqua while not)
   try {
     if (ledSocket?.readyState === WebSocket.OPEN) {
-      ledSocket.send(JSON.stringify({ type: 'alpha_score', wet: wetVal }));
+      ledSocket.send(JSON.stringify({ type: 'alpha_score', wet: wetVal, ready: ready !== false }));
     }
   } catch (e) {
     console.log('[LED] sendAlphaScore failed:', e);
@@ -448,17 +491,6 @@ let gammaMean = 0;
 // Effect names mapped to EEG bands
 const effectNames = ["Chorus", "Flanger", "Reverb", "Delay", "Distortion"];
 const eegBands = ["Alpha", "Low Beta", "High Beta", "Theta", "Gamma"];
-
-// Signal history for plotting
-const HISTORY_LENGTH = 300; // number of samples to display (~10 seconds at 30Hz)
-let signalHistory = {
-  "Alpha": [],
-  "Low Beta": [],
-  "High Beta": [],
-  "Theta": [],
-  "Gamma": [],
-  "Weighted": []
-};
 
 // Frame rate tracking
 let lastUpdateTime = 0;
@@ -705,13 +737,13 @@ function setup() {
     y += 25;
   }
 
-  // Autotrack — independent toggle, NOT part of the source radio group above
+  // Drift Fix — independent toggle, NOT part of the source radio group above
   // (it's a threshold-behavior mode, not an audio source, so it can be on
   // at the same time as any of Live/Tone/Sample without changing playback)
-  autotrackCheckbox = createCheckbox("Autotrack", autotrackEnabled);
-  autotrackCheckbox.position(20, y);
-  autotrackCheckbox.changed(() => {
-    toggleAutotrack(autotrackCheckbox.checked());
+  driftCheckbox = createCheckbox("Drift Fix", driftFixEnabled);
+  driftCheckbox.position(20, y);
+  driftCheckbox.changed(() => {
+    toggleDriftFix(driftCheckbox.checked());
   });
   y += 25;
 
@@ -810,7 +842,12 @@ function draw() {
       hasEEGData = false;
       smoothedAlpha = 0;
       rawAlphaMidi = 0;
-      sendAlphaScore(0);
+      // A real disconnect means the fast/slow EMAs' state is stale — start
+      // the drift-tracking convergence clock over on reconnect
+      fastEMA_alpha = null;
+      slowEMA_alpha = null;
+      driftStartTime = null;
+      sendAlphaScore(0, false);
     }
   }
 
@@ -838,48 +875,71 @@ function draw() {
   gammaN += 1;
   gammaMean += (gamma_rel - gammaMean) / gammaN;
 
-  // Calculate effect wet value using threshold offset
-  // Knob 3 (encoderThreshold, 0-127) controls how far above personal alpha mean
-  // the alpha must be before the effect activates.
-  // At threshold=64: effect is off at baseline, activates on elevated alpha
-  // At threshold=0: effect is always somewhat active
-  // At threshold=127: effect needs very high alpha to activate
-  const alphaDeviation = alpha_rel - alphaMean;  // How far from personal baseline
-  // Raw alpha mix: sigmoid maps deviation to 0-1 (no threshold applied)
-  // This is what the histogram bar shows — pure alpha activity
-  const rawAlphaMix = 1 / (1 + Math.exp(-10 * alphaDeviation));  // 0.5 at baseline, higher with more alpha
-  rawAlphaMidi = rawAlphaMix * 127;  // 0-127 for histogram display
+  const smoothK = 0.008;  // ~2s EMA at ~60fps, applied to both tracked signals below
 
-  // EMA smoothing on raw alpha: ~2 second time constant at ~60fps
-  const smoothK = 0.008;
-  smoothedAlpha += smoothK * (rawAlphaMidi - smoothedAlpha);
+  // --- "A" (legacy): deviation from a LIFETIME running mean. This mean's
+  // effective memory window grows without bound as the session runs, so it
+  // gradually stops tracking real drift at all — this is the root cause of
+  // the original "gets stuck" problem, independent of the old Autotrack code.
+  const deviationLegacy = alpha_rel - alphaMean;
+  const mixLegacy = 1 / (1 + Math.exp(-10 * deviationLegacy));
+  smoothedAlphaLegacy += smoothK * (mixLegacy * 127 - smoothedAlphaLegacy);
 
-  // Autotrack: if enabled, slowly reposition the threshold when it's been
-  // stuck fully on or fully off for a while (see AUTOTRACK_CONFIG above).
-  if (autotrackEnabled) {
-    const isOn = smoothedAlpha > encoderThreshold;
-    if (isOn !== autotrackStateOn) {
-      autotrackStateOn = isOn;
-      autotrackDwellFrames = 0;
-    } else {
-      autotrackDwellFrames++;
-    }
-    const graceFrames = AUTOTRACK_CONFIG.graceSeconds * 60;
-    if (autotrackDwellFrames > graceFrames) {
-      // Stuck off -> chase just above current alpha; stuck on -> chase just below
-      const target = isOn
-        ? smoothedAlpha - AUTOTRACK_CONFIG.margin
-        : smoothedAlpha + AUTOTRACK_CONFIG.margin;
-      encoderThreshold += AUTOTRACK_CONFIG.trackingRate * (target - encoderThreshold);
-      encoderThreshold = Math.max(0, Math.min(127, encoderThreshold));
-    }
+  // --- "B" (Drift Fix, per Greg Appelbaum): difference of a fast and a slow
+  // bounded EMA on alpha_rel. Slow baseline drift moves both EMAs together
+  // and cancels out in the subtraction; a genuine, faster state change shows
+  // up in the fast EMA before the slow one catches up, so it still registers.
+  // Unlike the lifetime mean above, the slow EMA never stops adapting.
+  if (fastEMA_alpha === null) {
+    fastEMA_alpha = alpha_rel;
+    slowEMA_alpha = alpha_rel;
+    driftStartTime = performance.now();
+  }
+  const kFast = 1 / (DRIFT_CONFIG.fastSeconds * 60);
+  const kSlow = 1 / (DRIFT_CONFIG.slowSeconds * 60);
+  fastEMA_alpha += kFast * (alpha_rel - fastEMA_alpha);
+  slowEMA_alpha += kSlow * (alpha_rel - slowEMA_alpha);
+  const deviationDrift = fastEMA_alpha - slowEMA_alpha;
+  const mixDrift = 1 / (1 + Math.exp(-10 * deviationDrift));
+  smoothedAlphaDrift += smoothK * (mixDrift * 127 - smoothedAlphaDrift);
+
+  // Readiness: has the slow EMA run long enough to be trusted for setting
+  // the threshold? Sent to the LED controller so it can show a "still
+  // training" indicator rather than letting you dial in a moving target.
+  const driftReady = driftStartTime !== null &&
+    (performance.now() - driftStartTime) >= DRIFT_CONFIG.readySeconds * 1000;
+
+  // Active tracked signal — whichever the A/B toggle selects. Both are
+  // always computed above regardless, so the drift-tracking plot can show
+  // both traces for comparison no matter which one is driving the effect.
+  smoothedAlpha = driftFixEnabled ? smoothedAlphaDrift : smoothedAlphaLegacy;
+  rawAlphaMidi = smoothedAlpha;  // 0-127 for histogram display
+
+  // Sample both traces into the drift-tracking plot's history once/sec —
+  // a 5-minute buffer at this rate is what actually makes drift visible
+  const nowMs = millis();
+  if (nowMs - lastDriftSampleTime >= 1000) {
+    lastDriftSampleTime = nowMs;
+    driftHistoryLegacy.push(smoothedAlphaLegacy);
+    driftHistoryDrift.push(smoothedAlphaDrift);
+    if (driftHistoryLegacy.length > DRIFT_HISTORY_LENGTH) driftHistoryLegacy.shift();
+    if (driftHistoryDrift.length > DRIFT_HISTORY_LENGTH) driftHistoryDrift.shift();
   }
 
-  // Threshold gate applied AFTER smoothing
-  // Effect intensity proportional to how far smoothed alpha exceeds threshold
-  const thresholdMidi = encoderThreshold;  // Knob 3 raw value 0-127
-  const chorus_wetVal = smoothedAlpha > thresholdMidi
-    ? Math.min(1, (smoothedAlpha - thresholdMidi) / (127 - thresholdMidi))
+  // Threshold gate with hysteresis: separate ON/OFF trip points around the
+  // (now fixed — no more Autotrack-style chasing) threshold, so the effect
+  // doesn't flicker right at the boundary. The threshold itself never moves;
+  // only the signal (via Drift Fix above) does.
+  const thresholdMidi = encoderThreshold;  // Knob 3 raw value 0-127, fixed
+  const onThresh = Math.min(127, thresholdMidi + DRIFT_CONFIG.deadband / 2);
+  const offThresh = Math.max(0, thresholdMidi - DRIFT_CONFIG.deadband / 2);
+  if (!effectOnState && smoothedAlpha > onThresh) {
+    effectOnState = true;
+  } else if (effectOnState && smoothedAlpha < offThresh) {
+    effectOnState = false;
+  }
+  const chorus_wetVal = effectOnState
+    ? Math.min(1, Math.max(0, (smoothedAlpha - offThresh) / (127 - offThresh)))
     : 0;
 
   // Master gate: effect is only active when EEG data flowing AND headset is worn
@@ -887,7 +947,7 @@ function draw() {
 
   // Send effect mix value to LED controller (~20Hz)
   if (frameCount % 3 === 0) {
-    sendAlphaScore(effectActive ? chorus_wetVal : 0);
+    sendAlphaScore(effectActive ? chorus_wetVal : 0, driftReady);
   }
 
   // Other effects use sigmoid
@@ -896,34 +956,17 @@ function draw() {
   const delay_feedback = sigmoid(theta_rel);
   const distortion_wetVal = 1 - sigmoid(gamma_rel, STEEP, gammaMean * threshold);
 
-  // Update signal history (store raw slider-scaled values, not relative)
-  signalHistory["Alpha"].push(alpha);
-  signalHistory["Low Beta"].push(lowBeta);
-  signalHistory["High Beta"].push(highBeta);
-  signalHistory["Theta"].push(theta);
-  signalHistory["Gamma"].push(gamma);
-  signalHistory["Weighted"].push(weighted);
-
-  // Trim history to max length
-  for (let key in signalHistory) {
-    if (signalHistory[key].length > HISTORY_LENGTH) {
-      signalHistory[key].shift();
-    }
-  }
 
   // Console logging - log every 30 seconds (reduced to minimize noise)
   if (frameCount % 1800 === 0) {
     console.log(`[XENBOX] Alpha:${nf(alpha_rel,1,3)} Chorus:${nf(chorus_wetVal,1,2)} HR:${heartRate} Worn:${isWorn?'YES':'NO'} MIDI:${midiEnabled&&isWorn?'ON':'SUPPRESSED'}`);
   }
 
-  // Draw signal plots (first, so overlays render on top)
-  drawSignalPlots();
-
   // Draw MIDI parameter histogram
   drawMIDIHistogram();
 
-  // Draw PPG waveform for debugging
-  drawPPGWaveform();
+  // PPG waveform debug view removed — worn/heart-rate detection is robust now
+  drawDriftTrackingPlot();
 
   // Consolidated status panel (drawn AFTER plots so it renders on top)
   push();
@@ -1003,7 +1046,7 @@ function draw() {
   // Values
   textSize(18);
   fill(255);
-  text(`GAIN:${MIDI_CONFIG.fixedValues.gain}  ${knob2Label}:${knob2Value}  THR:${Math.round(encoderThreshold)}${autotrackEnabled ? ' AT' : ''}`, encX + 10, encY + 35);
+  text(`GAIN:${MIDI_CONFIG.fixedValues.gain}  ${knob2Label}:${knob2Value}  THR:${Math.round(encoderThreshold)}${driftFixEnabled ? ' DF' : ''}`, encX + 10, encY + 35);
 
   // Show threshold status: effect active or inactive
   const thresholdActive = chorus_wetVal > 0.1;
@@ -1037,149 +1080,11 @@ function draw() {
   distortion.wet.value = 0;
 }
 
-function drawSignalPlots() {
-  // Dynamic sizing based on canvas
-  const plotX = 280;
-  const plotY = 50;
-  const plotWidth = width - plotX - 20;
-  const plotHeight = height - plotY - 80;
-  const plotPadding = 10;
-
-  // Background for plot area
-  push();
-  fill(255);
-  stroke(100);
-  strokeWeight(1);
-  rect(plotX, plotY, plotWidth, plotHeight);
-  pop();
-
-  // Colors for each band
-  const colors = {
-    "Alpha": [255, 100, 100],      // Red
-    "Low Beta": [100, 255, 100],   // Green
-    "High Beta": [100, 100, 255],  // Blue
-    "Theta": [255, 200, 100],      // Orange
-    "Gamma": [200, 100, 255],      // Purple
-    "Weighted": [50, 50, 50]       // Dark gray
-  };
-
-  // Calculate auto-scaling range based on all current data
-  let minVal = Infinity;
-  let maxVal = -Infinity;
-
-  for (let bandName in signalHistory) {
-    const history = signalHistory[bandName];
-    for (let val of history) {
-      if (isFinite(val)) {
-        if (val < minVal) minVal = val;
-        if (val > maxVal) maxVal = val;
-      }
-    }
-  }
-
-  // Handle edge cases
-  if (!isFinite(minVal) || !isFinite(maxVal)) {
-    minVal = 0;
-    maxVal = 1;
-  }
-
-  // Add 15% padding to range for better visualization
-  const range = maxVal - minVal;
-  const padding = range * 0.15;
-  minVal = minVal - padding;
-  maxVal = maxVal + padding;
-
-  // Ensure minimum range for stability when signals are very flat
-  if (maxVal - minVal < 0.01) {
-    const center = (maxVal + minVal) / 2;
-    minVal = center - 0.01;
-    maxVal = center + 0.01;
-  }
-
-  // Allow negative values and values > 1 for full dynamic range
-  // (don't clamp to 0-1 anymore)
-
-  // Draw grid lines
-  push();
-  stroke(220);
-  strokeWeight(1);
-  for (let i = 0; i <= 4; i++) {
-    const y = plotY + plotPadding + (plotHeight - 2 * plotPadding) * i / 4;
-    line(plotX + plotPadding, y, plotX + plotWidth - plotPadding, y);
-  }
-  pop();
-
-  // Draw each signal
-  const drawableWidth = plotWidth - 2 * plotPadding;
-  const drawableHeight = plotHeight - 2 * plotPadding;
-
-  for (let bandName in signalHistory) {
-    const history = signalHistory[bandName];
-    if (history.length < 2) continue;
-
-    const color = colors[bandName] || [0, 0, 0];
-    const lineWidth = bandName === "Weighted" ? 3 : 1.5;
-
-    push();
-    stroke(color[0], color[1], color[2]);
-    strokeWeight(lineWidth);
-    noFill();
-
-    beginShape();
-    for (let i = 0; i < history.length; i++) {
-      const x = plotX + plotPadding + (drawableWidth * i) / (HISTORY_LENGTH - 1);
-      // Map value from [minVal, maxVal] to full plot height
-      const normalizedVal = (history[i] - minVal) / (maxVal - minVal);
-      const val = constrain(normalizedVal, 0, 1);
-      const y = plotY + plotPadding + drawableHeight - (val * drawableHeight);
-      vertex(x, y);
-    }
-    endShape();
-    pop();
-  }
-
-  // Draw legend
-  push();
-  textSize(11);
-  textAlign(LEFT, CENTER);
-  let legendY = plotY + 15;
-  for (let bandName of ["Alpha", "Low Beta", "High Beta", "Theta", "Gamma", "Weighted"]) {
-    const color = colors[bandName];
-    fill(color[0], color[1], color[2]);
-    noStroke();
-    rect(plotX + plotWidth - 90, legendY - 4, 15, 8);
-    fill(0);
-    text(bandName, plotX + plotWidth - 70, legendY);
-    legendY += 15;
-  }
-  pop();
-
-  // Y-axis labels (showing actual scaled range)
-  push();
-  fill(0);
-  textSize(10);
-  textAlign(RIGHT, CENTER);
-  for (let i = 0; i <= 4; i++) {
-    const y = plotY + plotPadding + (plotHeight - 2 * plotPadding) * i / 4;
-    const val = maxVal - ((maxVal - minVal) * i / 4);
-    text(nf(val, 1, 3), plotX + plotPadding - 5, y);
-  }
-  pop();
-
-  // Title
-  push();
-  fill(0);
-  textSize(14);
-  textAlign(CENTER, TOP);
-  text("EEG Signal Monitor (Relative Power)", plotX + plotWidth / 2, plotY - 25);
-  pop();
-}
-
 function drawMIDIHistogram() {
   const histX = 20;
   // Below the effect checkboxes + input-source divider/label/checkboxes +
-  // Autotrack checkbox (see setup(): start y=60, 25px per effect row, +10 gap,
-  // +10 divider, +20 label, 25px per input-source row, +25 Autotrack row, +15 margin)
+  // Drift Fix checkbox (see setup(): start y=60, 25px per effect row, +10 gap,
+  // +10 divider, +20 label, 25px per input-source row, +25 Drift Fix row, +15 margin)
   const histY = 60 + EFFECT_ORDER.length * 25 + 10 + 10 + 20 + INPUT_SOURCE_ORDER.length * 25 + 25 + 15;
   const histWidth = 240;
   const histHeight = height - histY - 20;
@@ -1296,11 +1201,13 @@ function drawMIDIHistogram() {
     rect(histX + 55, y, barWidth, barHeight, 3);
     pop();
 
-    // Orange threshold marker on Mix bar
+    // Orange threshold marker on Mix bar — kept high-contrast even when
+    // inactive (was a light tan on a light gray background before, nearly
+    // invisible, easy to mistake for "the threshold isn't moving")
     if (param.dynamic) {
       const thrX = histX + 55 + (encoderThreshold / 127) * barMaxWidth;
       push();
-      stroke(effectActive ? color(255, 100, 0) : color(200, 180, 160));
+      stroke(effectActive ? color(255, 100, 0) : color(120, 60, 0));
       strokeWeight(2);
       line(thrX, y, thrX, y + barHeight);
       pop();
@@ -1319,79 +1226,108 @@ function drawMIDIHistogram() {
 
 }
 
-function drawPPGWaveform() {
-  // Draw PPG waveform at bottom of screen for debugging
-  const ppgX = 280;
-  const ppgY = height - 70;
-  const ppgWidth = width - ppgX - 20;
-  const ppgHeight = 60;
+function drawDriftTrackingPlot() {
+  // Shows the last 5 minutes of both tracked-signal candidates against the
+  // fixed threshold + hysteresis band, so drift (and whether Drift Fix is
+  // actually compensating for it) is visible at a glance rather than
+  // inferred from the effect getting stuck. Light trace = legacy
+  // (lifetime-mean) signal, which is expected to wander over a session;
+  // bold trace = Drift Fix (fast/slow EMA) signal, which should stay near
+  // the threshold band regardless of where the legacy trace has drifted to.
+  const plotX = 280;
+  const plotY = 50;  // takes the full space the raw multi-band plot used to occupy
+  const plotH = height - plotY - 20;
+  const plotW = width - plotX - 20;
 
-  // Background
   push();
   fill(255);
   stroke(100);
   strokeWeight(1);
-  rect(ppgX, ppgY, ppgWidth, ppgHeight, 3);
+  rect(plotX, plotY, plotW, plotH, 3);
   pop();
 
-  // Title
   push();
   fill(0);
   textSize(10);
   textAlign(LEFT, TOP);
-  const ppgStatus = ppgSampleCount > 0 ? `(${ppgSampleCount} samples)` : '(no data)';
-  text(`PPG Waveform ${ppgStatus}`, ppgX + 5, ppgY + 2);
+  text(`Drift Tracking (last 5 min) — ${driftFixEnabled ? 'Drift Fix ON' : 'Drift Fix OFF, legacy active'}`, plotX + 5, plotY + 2);
   pop();
 
-  // Draw waveform if we have data
-  if (ppgWaveform && ppgWaveform.length > 1) {
-    // Find min/max for scaling
-    let minVal = Infinity, maxVal = -Infinity;
-    for (let v of ppgWaveform) {
-      if (isFinite(v)) {
-        if (v < minVal) minVal = v;
-        if (v > maxVal) maxVal = v;
-      }
-    }
+  // Legend
+  push();
+  textSize(9);
+  textAlign(LEFT, CENTER);
+  stroke(180, 180, 180); strokeWeight(1);
+  line(plotX + plotW - 130, plotY + 8, plotX + plotW - 110, plotY + 8);
+  noStroke(); fill(100);
+  text("Legacy", plotX + plotW - 105, plotY + 8);
+  stroke(0, 160, 80); strokeWeight(2);
+  line(plotX + plotW - 60, plotY + 8, plotX + plotW - 40, plotY + 8);
+  noStroke(); fill(0, 120, 60);
+  text("Drift Fix", plotX + plotW - 35, plotY + 8);
+  pop();
 
-    // Ensure some range
-    if (maxVal - minVal < 1) {
-      const center = (maxVal + minVal) / 2;
-      minVal = center - 0.5;
-      maxVal = center + 0.5;
-    }
+  const innerX = plotX + 28;  // reserves room for the value-axis labels below
+  const innerY = plotY + 14;
+  const innerW = plotW - 33;
+  const innerH = plotH - 18;
 
-    // Draw the waveform
+  // Fixed 0-127 scale (same units as the threshold knob) so the threshold
+  // line and hysteresis band are stationary reference points on this plot
+  const valueToY = (v) => innerY + innerH - (v / 127) * innerH;
+
+  // Gridlines + value labels (0/32/64/96/127) — cheap to add now that there's
+  // real vertical room, and directly useful for judging the trend by eye
+  push();
+  stroke(230);
+  strokeWeight(1);
+  fill(150);
+  textSize(9);
+  textAlign(RIGHT, CENTER);
+  for (const v of [0, 32, 64, 96, 127]) {
+    const gy = valueToY(v);
+    line(innerX, gy, innerX + innerW, gy);
+    text(v, innerX - 3, gy);
+  }
+  pop();
+
+  // Hysteresis deadband (shaded) + threshold center line
+  const onThresh = Math.min(127, encoderThreshold + DRIFT_CONFIG.deadband / 2);
+  const offThresh = Math.max(0, encoderThreshold - DRIFT_CONFIG.deadband / 2);
+  push();
+  noStroke();
+  fill(255, 220, 0, 40);
+  rect(innerX, valueToY(onThresh), innerW, valueToY(offThresh) - valueToY(onThresh));
+  stroke(255, 180, 0);
+  strokeWeight(1);
+  line(innerX, valueToY(encoderThreshold), innerX + innerW, valueToY(encoderThreshold));
+  pop();
+
+  // Trace-drawing helper
+  const drawTrace = (history, strokeColor, weight) => {
+    if (history.length < 2) return;
     push();
-    stroke(255, 0, 100);  // Pink/red for PPG (blood)
-    strokeWeight(1.5);
+    stroke(...strokeColor);
+    strokeWeight(weight);
     noFill();
     beginShape();
-    for (let i = 0; i < ppgWaveform.length; i++) {
-      const x = ppgX + 5 + (i / (ppgWaveform.length - 1)) * (ppgWidth - 10);
-      const normalized = (ppgWaveform[i] - minVal) / (maxVal - minVal);
-      const y = ppgY + 15 + (ppgHeight - 20) - normalized * (ppgHeight - 20);
-      vertex(x, y);
+    for (let i = 0; i < history.length; i++) {
+      const x = innerX + (i / (DRIFT_HISTORY_LENGTH - 1)) * innerW;
+      vertex(x, valueToY(history[i]));
     }
     endShape();
     pop();
+  };
 
-    // Show value range
-    push();
-    fill(100);
-    textSize(8);
-    textAlign(RIGHT, TOP);
-    text(`max: ${maxVal.toFixed(0)}`, ppgX + ppgWidth - 5, ppgY + 2);
-    textAlign(RIGHT, BOTTOM);
-    text(`min: ${minVal.toFixed(0)}`, ppgX + ppgWidth - 5, ppgY + ppgHeight - 2);
-    pop();
-  } else {
-    // No data message
+  drawTrace(driftHistoryLegacy, [180, 180, 180], 1);   // light gray, thin — legacy
+  drawTrace(driftHistoryDrift, [0, 160, 80], 2);        // bold green — Drift Fix
+
+  if (driftHistoryLegacy.length < 2) {
     push();
     fill(150);
-    textSize(12);
+    textSize(11);
     textAlign(CENTER, CENTER);
-    text("No PPG data received", ppgX + ppgWidth / 2, ppgY + ppgHeight / 2);
+    text("Collecting data — plot fills in over the first few minutes", plotX + plotW / 2, plotY + plotH / 2 + 5);
     pop();
   }
 }
