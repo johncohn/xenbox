@@ -10,15 +10,20 @@ Communicates bidirectionally with the browser via WebSocket.
 LED Layout:
 - LED 0: GREEN when system ready, RED when bypass (GPIO17 grounded)
 - LED 1: PURPLE when Muse connected, PURPLE pulse when streaming + worn
-- LED 2: subtle slow YELLOW pulse while the browser's drift-tracking EMAs are
-  still converging (don't set the threshold yet); AQUA proportional to effect
-  mix once ready (when streaming + worn)
+- LED 2: AQUA proportional to effect mix (when streaming + worn), always —
+  the effect keeps working during drift-tracking convergence, so this never
+  stops reflecting it. A subtle slow YELLOW pulse blends in on top while
+  convergence isn't done yet, as a "may not be fully stable" warning, not
+  a replacement for the aqua readout.
 
 Encoder Layout (Adafruit Quad Encoder Breakout, I2C addr 0x49):
 - Encoder 0: Chorus gain (CC5, 0-127, default 100)
 - Encoder 1: Chorus depth (CC2, 0-127, default 64)
 - Encoder 2: EEG threshold/sensitivity (0-127, default 64)
 - Any button press: Save all values to /home/xenbox/encoder_settings.json
+- Gain + Depth buttons held together ~2s: absolute-pot calibration — resets
+  all three knobs' values to 0, assuming they're all physically turned to
+  the agreed low-stop reference (~6 o'clock) — see ABSOLUTE_POT_MODE below
 
 Requirements:
     pip3 install pi5neo websockets adafruit-circuitpython-seesaw
@@ -108,6 +113,61 @@ DEFAULT_ENCODER_VALUES = {
     'threshold': 64    # Encoder 2: EEG sensitivity
 }
 
+# --- Absolute-pot emulation (software-only, until real detented pots exist) ---
+# These encoders spin forever with no physical stops, so today a knob's
+# physical angle means nothing on its own — only accumulated deltas matter.
+# This makes the 0-127 value behave like a bounded pot instead: hard clamp
+# at both ends (already true below) plus a known counts-per-full-sweep ratio,
+# so a normal-feeling single turn covers the whole range, and a "calibrate"
+# gesture lets you tell the software "the knob is at its low stop right now"
+# so physical position and value line up again after any drift (power loss,
+# an accidental bump, etc). Set False to instantly revert to the old
+# 1-tick-per-unit free-spinning behavior if this turns out more confusing
+# than useful — nothing else about encoder handling changes when it's off.
+ABSOLUTE_POT_MODE = True
+COUNTS_PER_RANGE = 20     # encoder detents for one full knob throw (~1 turn).
+                          # Not yet verified against the real hardware's
+                          # detents-per-revolution — tune this at the device
+                          # until the sweep feels like a normal pot's ~300°.
+
+# Per-knob value range that one full COUNTS_PER_RANGE throw maps onto.
+# All three currently use the full 0-127 span — see SHAPE_K below for
+# threshold's non-linear response, which replaced an earlier attempt at
+# finer resolution via narrowing this range instead (lost the extremes;
+# superseded, not worth carrying two competing mechanisms at once).
+KNOB_RANGE = {
+    'gain': (0, 127),
+    'depth': (0, 127),
+    'threshold': (0, 127),
+}
+
+# Per-knob non-linear response curve, applied to the 0-1 normalized position
+# within a knob's KNOB_RANGE throw before scaling back to that range. 0 =
+# linear (gain/depth). Threshold uses a raised-cosine warp — output =
+# x + (k/2π)·sin(2πx) — which still reaches both ends of the full range (its
+# derivative integrates to 1 over [0,1], so shape(0)=0 and shape(1)=1 exactly
+# like the linear case) but has a shallower slope near the middle (finer
+# resolution — real thresholds cluster near the EMA baseline center) and a
+# steeper slope near the ends (coarser — the rarely-used "always on"/"almost
+# never on" extremes). Also passes through the exact center: shape(0.5)=0.5
+# always for this curve, so noon still lands on the EMA baseline center
+# (raw 63.5) same as the linear case. Must stay < 1 for the curve to remain
+# monotonic (a curve that isn't monotonic would make the knob feel like it's
+# moving backwards in places). Untested on real hardware — tune at the
+# device, and drop to 0 to fall back to plain linear if it feels odd.
+SHAPE_K = {
+    'gain': 0.0,
+    'depth': 0.0,
+    'threshold': 0.6,
+}
+CALIBRATION_HOLD_SECONDS = 2.0  # hold gain+depth buttons together this long,
+                                # with all three knobs at their agreed-upon
+                                # low-stop reference position, to recalibrate
+                                # all three to value 0 (displayed "1"). Kept
+                                # shorter than LONG_PRESS_SECONDS (single-button
+                                # encoder recovery) so it fires first and
+                                # suppresses that gesture for the same hold.
+
 
 class ConnectionState(Enum):
     IDLE = 'idle'
@@ -147,7 +207,12 @@ class LEDController:
         self.flash_save = False
         self.flash_counter = 0
 
-        # Encoder state
+        # Encoder state. knob_raw is the true tracked/persisted position
+        # (linear, accumulates scaled ticks, clamped to KNOB_RANGE) —
+        # encoder_values is derived from it via SHAPE_K and is what actually
+        # gets broadcast/used downstream (CC values, on-screen display).
+        # They're equal whenever a knob's SHAPE_K is 0 (gain/depth today).
+        self.knob_raw = dict(DEFAULT_ENCODER_VALUES)
         self.encoder_values = dict(DEFAULT_ENCODER_VALUES)
         self.seesaw = None
         self.encoders = []
@@ -160,6 +225,13 @@ class LEDController:
         self.button_press_start = [None] * ENCODER_COUNT  # Wall-clock time the current press began
         self.button_long_press_fired = [False] * ENCODER_COUNT  # Recovery already triggered this press
         self.encoder_dead = [False] * ENCODER_COUNT  # Slots that hang on read
+        self._pressed_now = [False] * ENCODER_COUNT  # This poll's raw pressed state, for combo detection
+
+        # Combo-hold state for the absolute-pot calibration gesture (gain +
+        # depth buttons held together) — tracked separately from each button's
+        # own single-press/long-press state above.
+        self.combo_calib_start = None   # Wall-clock time the combo hold began
+        self.combo_calib_fired = False  # Already calibrated during this hold
 
         # Connected WebSocket clients (for sending encoder values)
         self.ws_clients = set()
@@ -284,28 +356,64 @@ class LEDController:
         except Exception as e:
             print(f"[ENC] Recovery FAILED: {e}")
 
+    def _shape_output(self, key, raw):
+        """Map a knob's raw/linear tracked position (knob_raw, within its
+        KNOB_RANGE) to the value actually used downstream, via SHAPE_K's
+        raised-cosine warp. Identity when SHAPE_K[key] is 0. See SHAPE_K's
+        comment for the curve's properties."""
+        lo, hi = KNOB_RANGE[key]
+        k = SHAPE_K.get(key, 0.0)
+        if k == 0.0 or hi == lo:
+            return raw
+        x = (raw - lo) / (hi - lo)
+        shaped = x + (k / (2 * math.pi)) * math.sin(2 * math.pi * x)
+        return max(lo, min(hi, round(lo + shaped * (hi - lo))))
+
+    def _calibrate_absolute_positions(self):
+        """Absolute-pot calibration: assumes all three knobs are currently
+        turned to the agreed physical low-stop reference position (~6
+        o'clock) and resets each knob's tracked raw position to its own
+        KNOB_RANGE low bound to match — from here, COUNTS_PER_RANGE ticks
+        moves a knob through its full range, same as a real pot's sweep
+        from its low stop. Triggered by the gain+depth button combo — see
+        CALIBRATION_HOLD_SECONDS.
+        """
+        for key in ('gain', 'depth', 'threshold'):
+            lo, _hi = KNOB_RANGE[key]
+            self.knob_raw[key] = lo
+            self.encoder_values[key] = self._shape_output(key, lo)
+        print(f"[ENC] Calibration: knobs set to their low-stop reference: {self.encoder_values}")
+        self._save_encoder_settings(flash=True)
+        self._broadcast_encoder_values()
+
     def _load_encoder_settings(self):
-        """Load saved encoder values from JSON file"""
+        """Load saved knob raw positions from JSON file, then derive the
+        (possibly shaped) output values used downstream from them."""
         try:
             with open(SETTINGS_FILE, 'r') as f:
                 saved = json.load(f)
                 for key in DEFAULT_ENCODER_VALUES:
                     if key in saved:
-                        self.encoder_values[key] = max(0, min(127, int(saved[key])))
-                print(f"[ENC] Loaded settings from {SETTINGS_FILE}: {self.encoder_values}")
+                        lo, hi = KNOB_RANGE[key]
+                        self.knob_raw[key] = max(lo, min(hi, int(saved[key])))
+                print(f"[ENC] Loaded settings from {SETTINGS_FILE}: {self.knob_raw}")
         except FileNotFoundError:
-            print(f"[ENC] No saved settings, using defaults: {self.encoder_values}")
+            print(f"[ENC] No saved settings, using defaults: {self.knob_raw}")
         except Exception as e:
             print(f"[ENC] Error loading settings: {e}, using defaults")
+        for key in DEFAULT_ENCODER_VALUES:
+            self.encoder_values[key] = self._shape_output(key, self.knob_raw[key])
 
     def _save_encoder_settings(self, flash=True):
-        """Save current encoder values to JSON file. flash=False skips the
-        confirmation LED animation (~500ms) — used when a button press needs
-        to feel responsive, e.g. the live-input toggle."""
+        """Save current knob raw positions to JSON file — the persisted
+        truth, from which (possibly shaped) output values are re-derived on
+        load. flash=False skips the confirmation LED animation (~500ms) —
+        used when a button press needs to feel responsive, e.g. the
+        live-input toggle."""
         try:
             with open(SETTINGS_FILE, 'w') as f:
-                json.dump(self.encoder_values, f, indent=2)
-            print(f"[ENC] Saved settings to {SETTINGS_FILE}: {self.encoder_values}")
+                json.dump(self.knob_raw, f, indent=2)
+            print(f"[ENC] Saved settings to {SETTINGS_FILE}: {self.knob_raw}")
             if flash:
                 # Trigger LED flash to confirm save
                 with self.lock:
@@ -431,14 +539,30 @@ class LEDController:
                     delta = pos - self.last_positions[i]
                     if delta != 0:
                         self.last_positions[i] = pos
-                        old_val = self.encoder_values[keys[i]]
-                        new_val = max(0, min(127, old_val + delta))
-                        if new_val != old_val:
-                            self.encoder_values[keys[i]] = new_val
-                            print(f"[ENC] {keys[i]}: {old_val} -> {new_val} (slot{ENCODER_INDICES[i]})")
-                            changed = True
+                        key = keys[i]
+                        old_raw = self.knob_raw[key]
+                        # Absolute-pot mode: scale raw ticks so COUNTS_PER_RANGE
+                        # ticks sweeps this knob's full range (KNOB_RANGE),
+                        # instead of 1 tick per unit (which took 5+ turns to
+                        # reach either end of the old, always-0-127 range).
+                        lo, hi = KNOB_RANGE[key] if ABSOLUTE_POT_MODE else (0, 127)
+                        scaled_delta = delta * ((hi - lo) / COUNTS_PER_RANGE) if ABSOLUTE_POT_MODE else delta
+                        new_raw = max(lo, min(hi, round(old_raw + scaled_delta)))
+                        if new_raw != old_raw:
+                            self.knob_raw[key] = new_raw
                             self._autosave_dirty = True
                             self._autosave_time = time.time() + 5.0  # save 5s after last turn
+                            # SHAPE_K may map several adjacent raw positions to the
+                            # same rounded output (deliberately, in the flattened
+                            # middle region) — only broadcast/log when the actual
+                            # output value moves, same as before this was split
+                            # into raw-vs-shaped.
+                            old_val = self.encoder_values[key]
+                            new_val = self._shape_output(key, new_raw)
+                            if new_val != old_val:
+                                self.encoder_values[key] = new_val
+                                print(f"[ENC] {key}: raw {old_raw}->{new_raw}, value {old_val}->{new_val} (slot{ENCODER_INDICES[i]})")
+                                changed = True
 
                 # Read button (active low) — debounce + cooldown (wall-clock time, not poll
                 # count — actual poll rate depends on I2C transaction latency at this board's
@@ -452,6 +576,7 @@ class LEDController:
                     self._btn_last_raw[i] = raw_val
                     now = time.time()
                     pressed = not raw_val
+                    self._pressed_now[i] = pressed
 
                     # Long-press-and-hold recovery gesture — checked independently of
                     # the cooldown gate below, so holding still works even right after
@@ -477,6 +602,17 @@ class LEDController:
                             # browser action — it adds ~500ms and those already give fast,
                             # visible feedback of their own
                             self._save_encoder_settings(flash=(i not in (0, 1, 2)))
+                            # Whichever of gain/depth is pressed FIRST still fires its normal
+                            # single-press action below, even when going for the calibration
+                            # combo — only the second button's own action is suppressed here.
+                            # Known, accepted quirk for now (see CALIBRATION_HOLD_SECONDS
+                            # comment): calibrating will flip live-input-source or Drift Fix
+                            # once as a side effect. Revisit only if that proves annoying live.
+                            if i in (0, 1) and self.button_press_start[1 - i] is not None:
+                                print(f"[ENC] Button {i} - suppressing single-press action (combo in progress)")
+                                self.button_was_pressed[i] = pressed
+                                self.button_cooldown_until[i] = now + 0.2
+                                continue
                             if i == 0:
                                 # Gain knob (slot 1) button also toggles live input on the browser
                                 print(f"[ENC] Button {i} (slot{ENCODER_INDICES[i]}) - toggling live input")
@@ -500,6 +636,27 @@ class LEDController:
 
         except Exception as e:
             print(f"[ENC] Poll error: {e}")
+
+        # Absolute-pot calibration combo: gain + depth buttons held together
+        # for CALIBRATION_HOLD_SECONDS. Checked every poll (not just while a
+        # button's own state is being processed above) so both being held
+        # this poll cycle is always seen regardless of per-button read order.
+        both_held = self._pressed_now[0] and self._pressed_now[1]
+        if both_held:
+            if self.combo_calib_start is None:
+                self.combo_calib_start = time.time()
+                self.combo_calib_fired = False
+            elif not self.combo_calib_fired and (time.time() - self.combo_calib_start) >= CALIBRATION_HOLD_SECONDS:
+                self.combo_calib_fired = True
+                # Suppress the individual 3s long-press recovery gesture for
+                # both buttons while still held — combo fires first (2s < 3s)
+                # and calibrating shouldn't also trigger an encoder reset.
+                self.button_long_press_fired[0] = True
+                self.button_long_press_fired[1] = True
+                self._calibrate_absolute_positions()
+        else:
+            self.combo_calib_start = None
+            self.combo_calib_fired = False
 
         # Auto-save 5s after last knob change (in case user doesn't press button)
         if getattr(self, '_autosave_dirty', False):
@@ -604,21 +761,22 @@ class LEDController:
                 elif muse_state in (ConnectionState.STREAMING, ConnectionState.CONNECTED):
                     led1_r, led1_g, led1_b = BRIGHTNESS, 0, BRIGHTNESS  # PURPLE solid
 
-                # LED 2: AQUA — directly mirrors effect wet value (0-1) once the
-                # browser's drift-tracking EMAs have converged. Before that, a
-                # subtle slow yellow pulse signals "don't set the threshold yet —
-                # still training" rather than showing a wet value that's being
-                # measured against a moving baseline.
+                # LED 2: AQUA always mirrors effect wet value (0-1) — the effect
+                # itself never stops working while drift-tracking is still
+                # converging, so the LED shouldn't stop showing it either.
+                # While not yet converged, a slow yellow pulse is blended in on
+                # top (red channel only) as a "may not be fully stable yet"
+                # warning, not a takeover of the indicator.
+                # xenbox_eeg.js already zeros wet when not worn or no EEG data
+                mix_br = int(wet_value * BRIGHTNESS)
+                led2_g, led2_b = mix_br, int(mix_br * 0.8)  # AQUA (green + blue), always
                 if not drift_ready:
                     pulse = (math.sin(time.time() * 2 * math.pi / 6.0) + 1) / 2  # 0-1 over 6s, slower than LED1's
                     gamma_pulse = pulse ** 2.2
                     subtle_max = max(1, BRIGHTNESS // 3)  # deliberately low — "subtle", not attention-grabbing
-                    br = int(1 + gamma_pulse * (subtle_max - 1))
-                    led2_r, led2_g, led2_b = br, br, 0  # YELLOW pulse (red + green)
+                    led2_r = int(gamma_pulse * subtle_max)  # pulsing warm overlay, mixes with the aqua above
                 else:
-                    # xenbox_eeg.js already zeros wet when not worn or no EEG data
-                    mix_br = int(wet_value * BRIGHTNESS)
-                    led2_r, led2_g, led2_b = 0, mix_br, int(mix_br * 0.8)  # AQUA (green + blue)
+                    led2_r = 0
 
                 if self.neo:
                     self.neo.set_led_color(0, led0_g, led0_r, led0_b)  # swap r/g for RGB LEDs
