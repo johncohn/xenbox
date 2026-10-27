@@ -264,6 +264,8 @@ const DRIFT_CONFIG = {
                        // touching this again.
 };
 let driftFixEnabled = true;    // ON by default
+let driftReady = false;        // true once slow EMA has run >= readySeconds — promoted to
+                                // module level so drawDriftTrackingPlot() can read it
 let fastEMA_alpha = null;      // null = not yet seeded (seeded from first real sample)
 let slowEMA_alpha = null;
 let driftStartTime = null;     // performance.now() at first seed — for the readiness clock.
@@ -916,7 +918,8 @@ function draw() {
   // Readiness: has the slow EMA run long enough to be trusted for setting
   // the threshold? Sent to the LED controller so it can show a "still
   // training" indicator rather than letting you dial in a moving target.
-  const driftReady = driftStartTime !== null &&
+  // Assigned to module-level driftReady so drawDriftTrackingPlot() can read it.
+  driftReady = driftStartTime !== null &&
     (performance.now() - driftStartTime) >= DRIFT_CONFIG.readySeconds * 1000;
 
   // Active tracked signal — whichever the A/B toggle selects. Both are
