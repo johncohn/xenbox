@@ -108,7 +108,7 @@ LONG_PRESS_SECONDS = 3.0  # hold any encoder button this long to trigger encoder
 
 # Default encoder values (0-127 MIDI range)
 DEFAULT_ENCODER_VALUES = {
-    'gain': 100,       # Encoder 0: Chorus gain (CC5)
+    'gain': 70,        # Encoder 0: Chorus gain (CC5) — reduced from 100 to avoid output clipping
     'depth': 64,       # Encoder 1: Chorus depth (CC2)
     'threshold': 64    # Encoder 2: EEG sensitivity
 }

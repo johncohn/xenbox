@@ -171,7 +171,7 @@ const MIDI_CONFIG = {
   fixedValues: {
     rate: 24,              // 1.5 Hz: (1.5 / 8) * 127 ≈ 24
     feedback: 64,          // 0.4 after PD ×0.8 scaling — adds richness
-    gain: 100,             // ~0.8 default gain
+    gain: 70,              // ~0.55 default gain — reduced from 100 to avoid output clipping
     sweep: 0               // Turn OFF auto-sweep (xenbox controls params)
   },
 
@@ -236,6 +236,16 @@ const DRIFT_CONFIG = {
                        // test at 120s showed a multi-minute residual arc in the
                        // "corrected" trace, evidence 120s wasn't slow enough to
                        // fully absorb it. Greg's suggested range was 2-5 min.
+  sigmoidGain: 20,     // Amplification applied to the (fastEMA - slowEMA) deviation
+                       // before the sigmoid that maps it to the 0-127 tracked value.
+                       // alpha_rel is a fraction (0-0.4 range), so the deviation
+                       // between the two EMAs is small (0.01-0.1 typical) — without
+                       // enough gain here the sigmoid barely moves off 63.5 and even
+                       // genuine relaxation registers as a weak effect. Higher values
+                       // amplify real signal but also noise; lower values are more
+                       // conservative. Was hardcoded as 10; bumped to 20 as first
+                       // experiment. Try 30 if signal still feels too weak; drop back
+                       // to 10 to restore original behaviour.
   deadband: 8,         // ON/OFF hysteresis width around the threshold (0-127 units),
                        // prevents flicker right at the boundary
   readySeconds: 480    // how long the slow EMA needs to run before it's considered
@@ -900,7 +910,7 @@ function draw() {
   fastEMA_alpha += kFast * (alpha_rel - fastEMA_alpha);
   slowEMA_alpha += kSlow * (alpha_rel - slowEMA_alpha);
   const deviationDrift = fastEMA_alpha - slowEMA_alpha;
-  const mixDrift = 1 / (1 + Math.exp(-10 * deviationDrift));
+  const mixDrift = 1 / (1 + Math.exp(-DRIFT_CONFIG.sigmoidGain * deviationDrift));
   smoothedAlphaDrift += smoothK * (mixDrift * 127 - smoothedAlphaDrift);
 
   // Readiness: has the slow EMA run long enough to be trusted for setting
