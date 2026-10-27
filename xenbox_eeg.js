@@ -248,18 +248,20 @@ const DRIFT_CONFIG = {
                        // to 10 to restore original behaviour.
   deadband: 8,         // ON/OFF hysteresis width around the threshold (0-127 units),
                        // prevents flicker right at the boundary
-  readySeconds: 480    // how long the slow EMA needs to run before it's considered
-                       // converged enough to trust for setting the threshold —
-                       // 2x slowSeconds is a reasonable rule of thumb.
-                       // Tried cutting to 1x (240) to shorten the "training" wait,
-                       // reverted: a several-minute live trace showed persistent
-                       // minute-scale wander in the drift-corrected signal even at
-                       // the original 480 — readySeconds isn't the cause (it only
-                       // gates when we trust the value, not whether fast-slow EMA
-                       // subtraction actually removes this kind of movement — it
-                       // doesn't; only much-slower-than-slowSeconds drift cancels).
-                       // Shortening it would just mean trusting the still-wandering
-                       // value sooner. Root cause is unresolved — see whether that
+  readySeconds: 180    // how long the slow EMA needs to run before switching from
+                       // legacy to drift-corrected signal. Cut from 480→180 (3 min):
+                       // we now fall back to legacy during warmup anyway, so the cost
+                       // of trusting it a bit early is low. Watch the drift plot — if
+                       // the green trace looks settled after 3 min in practice, this
+                       // is fine; if it's still visibly wandering at handoff, bump
+                       // back up toward 240 or 300.
+                       // Earlier history: was 480 (2× slowSeconds). Tried cutting to
+                       // 240 and reverted — a live trace showed minute-scale wander
+                       // even at 480 — but that wander persists regardless of
+                       // readySeconds since it's a property of the fast/slow-EMA
+                       // band-pass gap, not of convergence time. The only real
+                       // question is whether the baseline is settled enough to be
+                       // useful, which 3 min is likely sufficient for. See whether that
                        // 1-4min wander is real alpha-state signal or artifact before
                        // touching this again.
 };
@@ -1271,6 +1273,28 @@ function drawDriftTrackingPlot() {
   const activeLabel = (driftFixEnabled && driftReady) ? 'Drift Fix active' : driftFixEnabled ? 'Legacy active (Drift Fix warming up)' : 'Legacy active (Drift Fix OFF)';
   text(`Drift Tracking (last 5 min) — ${activeLabel}`, plotX + 5, plotY + 2);
   pop();
+
+  // Countdown banner while Drift Fix is enabled but still warming up
+  if (driftFixEnabled && !driftReady && driftStartTime !== null) {
+    const elapsedS = (performance.now() - driftStartTime) / 1000;
+    const remainS = Math.max(0, Math.ceil(DRIFT_CONFIG.readySeconds - elapsedS));
+    const mm = Math.floor(remainS / 60);
+    const ss = String(remainS % 60).padStart(2, '0');
+    push();
+    fill(200, 140, 0);
+    textSize(13);
+    textAlign(RIGHT, TOP);
+    textStyle(BOLD);
+    text(`Drift Fix warming up — ${mm}:${ss} left`, plotX + plotW - 6, plotY + 2);
+    pop();
+  } else if (driftFixEnabled && !driftReady && driftStartTime === null) {
+    push();
+    fill(150);
+    textSize(11);
+    textAlign(RIGHT, TOP);
+    text('Waiting for EEG data to start warmup...', plotX + plotW - 6, plotY + 2);
+    pop();
+  }
 
   // Legend
   push();
