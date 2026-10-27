@@ -93,29 +93,25 @@ sudo journalctl -u yq-led-controller -f
 
 ## 4. Controlling the xenbox hardware
 
-### The three knobs
+### The three knobs — turn and press
 
-The Adafruit encoder board has three rotary knobs, each mapped to a function:
+Each knob has two actions: **turn** (continuous control) and **press** (one-shot action). Labels in **(parens)** match the text printed on the panel.
 
-| Knob | Controls | Notes |
+| Knob | **Turn** | **Press** |
 |---|---|---|
-| **Knob 1** | Master Gain (MIDI CC5) | Overall output level to the amp. |
-| **Knob 2** | Depth (Chorus mode) or Drive (Harmonics mode) | Its function follows whichever effect is currently active. |
-| **Knob 3** | EEG Threshold | How much alpha (relaxation) is needed before the effect starts kicking in. Low = effect is almost always at least a little active; high = you need a strong, sustained relaxed state to trigger it. |
+| **Knob 1 (VOL)** | Master gain / volume (CC5, default 100) | Cycle input source **(SRC)**: Live → Tone → Sample → Airport → Zone → Live |
+| **Knob 2 (MIX)** | Effect character / depth (CC2, default 64) | Toggle Drift Fix on / off *(no panel label yet)* |
+| **Knob 3 (THR)** | EEG activation threshold (default 64) | Cycle to next effect **(EFX)** — 7 effects total, wraps around |
 
-Just turn a knob — the change applies immediately (no need to press anything). **Press any knob** to save the current gain/depth/threshold values to disk (`/home/xenbox/encoder_settings.json`), so they persist across reboots. A quick white flash on all three LEDs confirms the save.
+**Knob 3 / threshold notes:** one full turn (~300°) sweeps the full range. The response is non-linear — finer resolution in the middle (where real thresholds cluster) and coarser near the rarely-used extremes. Noon = EEG baseline center.
 
-### Switching effects (Chorus vs. Harmonics)
+**Effect order (Knob 3 press cycles through):** Chorus → Harmonics (Saturation) → Auto-Pan → Tremolo → Filter Sweep → Ring Mod → Bitcrush
 
-This is done from the on-screen UI (two checkboxes, radio-style — only one can be active), not from a knob. That means you need either a touchscreen/mouse on the Pi's display or the remote dashboard (§3) to change it. **Harmonics (saturation) is the default at power-up.**
+**Auto-save:** settings write to disk automatically 5 seconds after the last knob turn, or immediately on any button press. A quick white flash on all three LEDs confirms a save.
 
 ### The bypass switch
 
-A physical switch wired to GPIO17. When closed (grounded), the signal path goes fully dry — no chorus, no saturation — and LED 0 turns red. Open it to return to normal (LED 0 green). This is a hardware bypass, independent of anything happening in software.
-
-### Live instrument input vs. test tone
-
-There's also a "Live Input" checkbox on the dashboard — toggles the Bela patch between its internal test tone generator and your guitar/instrument's live input (MIDI CC9). Leave it off to just hear the test tone while checking that effects respond to your EEG; turn it on to actually process your instrument.
+A physical switch wired to GPIO17. When closed (grounded), the signal path goes fully dry and LED 0 **(BYP)** turns red. Open it to return to normal (LED 0 green). This is a hardware bypass, independent of software.
 
 ---
 

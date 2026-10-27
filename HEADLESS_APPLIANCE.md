@@ -183,31 +183,48 @@ Single WebSocket server in `led_status_controller.py`. Two clients connect:
 
 | CC | Parameter | Range | Source |
 |----|-----------|-------|--------|
-| CC1 | Chorus Rate | 0.1-8 Hz | Fixed |
-| CC2 | Chorus Depth | 0-1 | Encoder knob 2 (chorus mode) |
-| CC3 | Chorus Feedback | 0-0.8 | Fixed |
-| CC4 | Chorus Mix | 0-1 | Alpha EEG (when chorus active) |
-| CC5 | Master Gain | 0-1 | Encoder knob 1 |
+| CC1 | Chorus Rate | 0.1–8 Hz | Fixed (1.5 Hz) |
+| CC2 | Chorus Depth | 0–1 | Encoder knob 2 (chorus active) |
+| CC3 | Chorus Feedback | 0–0.8 | Fixed |
+| CC4 | Chorus Mix | 0–1 | Alpha EEG (when chorus active) |
+| CC5 | Master Gain | 0–1 | Encoder knob 1 (VOL) |
 | CC6 | Sweep Enable | On/Off | Fixed (off) |
-| CC7 | Saturation Mix | 0-1 | Alpha EEG (when saturation active) |
-| CC8 | Saturation Drive | 1-10 | Encoder knob 2 (saturation mode) |
-| CC9 | Input Source | Tone/Live | "Live Input" checkbox |
+| CC7 | Saturation Mix | 0–1 | Alpha EEG (when saturation active) |
+| CC8 | Saturation Drive | 1–10 | Encoder knob 2 (saturation active) |
+| CC9 | Input Source | 0–4 | Knob 1 button (SRC): 0=Tone, 1=Live, 2=Sample, 3=Airport, 4=Zone |
+| CC10 | Auto-Pan Mix | 0–1 | Alpha EEG (when auto-pan active) |
+| CC11 | Auto-Pan Rate | 0–127 | Encoder knob 2 (auto-pan active) |
+| CC12 | Tremolo Mix | 0–1 | Alpha EEG (when tremolo active) |
+| CC13 | Tremolo Rate | 0–127 | Encoder knob 2 (tremolo active) |
+| CC14 | Filter Sweep Mix | 0–1 | Alpha EEG (when filter sweep active) |
+| CC15 | Filter Sweep Range | 0–127 | Encoder knob 2 (filter sweep active) |
+| CC16 | Ring Mod Mix | 0–1 | Alpha EEG (when ring mod active) |
+| CC17 | Ring Mod Pitch | 0–127 | Encoder knob 2 (ring mod active) |
+| CC18 | Bitcrush Mix | 0–1 | Alpha EEG (when bitcrush active) |
+| CC19 | Bitcrush Depth | 0–127 | Encoder knob 2 (bitcrush active) |
 
 ---
 
 ## Effect Switching
 
-Two effects available, one active at a time (radio buttons on dashboard):
+Seven effects, one active at a time. **Cycle with Knob 3 button press (EFX).** Power-up default: Harmonics (Saturation).
 
-| Effect | Mix CC | Param CC | Description |
-|--------|--------|----------|-------------|
-| **Chorus** | CC4 | CC2 (depth) | Stereo chorus with LFO modulation |
-| **Harmonics** (default) | CC7 | CC8 (drive) | Soft saturation (cubic waveshaping, adds overtones) |
+| Effect | Mix CC | Param CC (Knob 2) | Description |
+|--------|--------|-------------------|-------------|
+| **Harmonics** (default) | CC7 | CC8 — Drive | Soft saturation, adds overtones |
+| **Chorus** | CC4 | CC2 — Depth | Stereo chorus with LFO modulation |
+| **Auto-Pan** | CC10 | CC11 — Rate | LFO-driven left/right panning |
+| **Tremolo** | CC12 | CC13 — Rate | LFO-driven amplitude tremolo |
+| **Filter Sweep** | CC14 | CC15 — Range | Sweeping low-pass filter |
+| **Ring Mod** | CC16 | CC17 — Pitch | Ring modulation against a carrier |
+| **Bitcrush** | CC18 | CC19 — Depth | Bit-depth reduction |
 
 When switching effects:
 - Active effect gets `wet * 127` on its mix CC
-- Inactive effect gets `0` on its mix CC
-- Encoder knob 2 remaps to the active effect's parameter
+- All other effects get `0` on their mix CC
+- Encoder knob 2 remaps to the active effect's parameter (CC2/CC8/CC11/CC13/CC15/CC17/CC19)
+
+Effects are always computing in the Bela patch (gain-gated to silent when inactive) — not a true DSP bypass, so more active effects cost real CPU. Block size is set to 128 in Bela's `settings.json` to handle the full 7-effect chain.
 
 ### Safety Gating
 
@@ -231,13 +248,15 @@ This is enforced in two places:
 
 > **Pixel order:** LEDs use RGB byte order. Pi5Neo only supports an `RGB` pixel type but internally outputs GRB, so r and g are swapped at every `set_led_color()` call to compensate.
 
-| LED | Color | Meaning |
-|-----|-------|---------|
-| 0 | **GREEN** (solid) | System ready, running normally |
-| 0 | **RED** (solid) | Bypass mode (GPIO17 grounded) |
-| 1 | **PURPLE** (pulse) | Muse streaming + worn (5s sine pulse, gamma-corrected) |
-| 1 | **PURPLE** (solid) | Muse connected but not worn |
-| 2 | **AQUA** (variable) | Effect mix level — directly mirrors audio wet value (0 when not worn) |
+| LED | Label | Color | Meaning |
+|-----|-------|-------|---------|
+| 0 | BYP | **GREEN** (solid) | System ready, running normally |
+| 0 | BYP | **RED** (solid) | Bypass mode (GPIO17 grounded) |
+| 1 | MUS | **PURPLE** (pulse) | Muse streaming + worn (5s sine pulse, gamma-corrected) |
+| 1 | MUS | **PURPLE** (solid) | Muse connected but not worn |
+| 2 | ACT | **AQUA** (variable) | Effect mix level — directly mirrors audio wet value (0 when not worn) |
+| 2 | ACT | **AQUA + faint YELLOW pulse** | Same as above, plus Drift Fix EMAs still converging (<8 min from startup) — effect is working, yellow is a "not yet stable" warning only |
+| all | — | **WHITE flash** (500ms) | Knob settings saved to disk |
 
 ### Bypass Switch (GPIO17)
 
@@ -245,13 +264,13 @@ A physical bypass switch connects **GPIO17** to **GND**. The LED controller conf
 
 ### Rotary Encoders (Adafruit Quad Breakout, I2C 0x49)
 
-| Slot | Function | MIDI CC | Default |
-|------|----------|---------|---------|
-| 1 | Master Gain | CC5 | 100 |
-| 2 | Depth/Drive | CC2/CC8 | 64 |
-| 3 | EEG Threshold | (local) | 64 |
+| Slot | Label | Turn | CC | Default | Button press |
+|------|-------|------|----|---------|--------------|
+| 1 | VOL | Master Gain | CC5 | 100 | Cycle input source (SRC): Tone→Live→Sample→Airport→Zone |
+| 2 | MIX | Effect Depth/Drive | CC2/CC8/… | 64 | Toggle Drift Fix on/off *(no panel label yet)* |
+| 3 | THR | EEG Threshold | (local) | 64 | Cycle to next effect (EFX) |
 
-Button press on any encoder saves current values to `/home/xenbox/encoder_settings.json`.
+One full turn (~300°, ~20 detents) sweeps the full 0–127 range (absolute-pot emulation mode). Knob 3 uses a non-linear raised-cosine response for finer resolution near the center. Settings auto-save 5s after the last turn, or immediately on any button press (white LED flash confirms). Any single button held 3s triggers an encoder chip reset (seesaw `sw_reset`); Knob 1 + Knob 2 held together 2s recalibrates all knob positions to zero.
 
 > **Implementation note:** Encoder buttons must be initialized with `btn.switch_to_input(pull=digitalio.Pull.UP)` — using `pull=True` (a boolean) silently falls through to plain `INPUT` mode, which sends `GPIO_PULLENCLR` to the seesaw chip and breaks encoder counting on the lowest-numbered slot. Encoders are polled at 30Hz (every 2nd frame of the 60Hz LED loop).
 
