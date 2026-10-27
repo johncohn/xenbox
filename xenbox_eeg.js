@@ -236,16 +236,15 @@ const DRIFT_CONFIG = {
                        // test at 120s showed a multi-minute residual arc in the
                        // "corrected" trace, evidence 120s wasn't slow enough to
                        // fully absorb it. Greg's suggested range was 2-5 min.
-  sigmoidGain: 20,     // Amplification applied to the (fastEMA - slowEMA) deviation
+  sigmoidGain: 10,     // Amplification applied to the (fastEMA - slowEMA) deviation
                        // before the sigmoid that maps it to the 0-127 tracked value.
                        // alpha_rel is a fraction (0-0.4 range), so the deviation
-                       // between the two EMAs is small (0.01-0.1 typical) — without
-                       // enough gain here the sigmoid barely moves off 63.5 and even
-                       // genuine relaxation registers as a weak effect. Higher values
-                       // amplify real signal but also noise; lower values are more
-                       // conservative. Was hardcoded as 10; bumped to 20 as first
-                       // experiment. Try 30 if signal still feels too weak; drop back
-                       // to 10 to restore original behaviour.
+                       // between the two EMAs is small (0.01-0.1 typical). This was
+                       // bumped to 20 as an experiment but that saturates the sigmoid
+                       // while the slow EMA is still below Mike's resting baseline —
+                       // the Drift Fix trace pegs near 127 and stays there. Reverted
+                       // to 10. Will need a controlled test with the Drift Fix OFF
+                       // (legacy working) before retuning this.
   deadband: 8,         // ON/OFF hysteresis width around the threshold (0-127 units),
                        // prevents flicker right at the boundary
   readySeconds: 180    // how long the slow EMA needs to run before switching from
@@ -265,7 +264,10 @@ const DRIFT_CONFIG = {
                        // 1-4min wander is real alpha-state signal or artifact before
                        // touching this again.
 };
-let driftFixEnabled = true;    // ON by default
+let driftFixEnabled = false;   // OFF by default — legacy signal works well in practice;
+                                // Drift Fix saturates while the slow EMA is still below
+                                // Mike's resting alpha. Re-enable via checkbox/Knob2 once
+                                // we tune sigmoidGain and slowSeconds for his signal range.
 let driftReady = false;        // true once slow EMA has run >= readySeconds — promoted to
                                 // module level so drawDriftTrackingPlot() can read it
 let driftHandoffTime = null;   // performance.now() when driftReady first became true —
