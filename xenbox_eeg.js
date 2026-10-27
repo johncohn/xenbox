@@ -236,15 +236,18 @@ const DRIFT_CONFIG = {
                        // test at 120s showed a multi-minute residual arc in the
                        // "corrected" trace, evidence 120s wasn't slow enough to
                        // fully absorb it. Greg's suggested range was 2-5 min.
-  sigmoidGain: 10,     // Amplification applied to the (fastEMA - slowEMA) deviation
-                       // before the sigmoid that maps it to the 0-127 tracked value.
-                       // alpha_rel is a fraction (0-0.4 range), so the deviation
-                       // between the two EMAs is small (0.01-0.1 typical). This was
-                       // bumped to 20 as an experiment but that saturates the sigmoid
-                       // while the slow EMA is still below Mike's resting baseline —
-                       // the Drift Fix trace pegs near 127 and stays there. Reverted
-                       // to 10. Will need a controlled test with the Drift Fix OFF
-                       // (legacy working) before retuning this.
+  linearScale: 500,    // Linear scale for the drift-corrected signal:
+                       //   smoothedAlphaDrift = 64 + (fastEMA - slowEMA) * linearScale
+                       // Signal is always 64 when alpha = slow baseline (deviation=0),
+                       // goes above 64 when Mike relaxes (faster than the slow baseline),
+                       // and returns to 64 when he sustains that state long enough for
+                       // the slow EMA to catch up. Can't saturate at max unless deviation
+                       // exceeds 63/500 = 0.126 — well outside typical alpha_rel range.
+                       // Replaces the sigmoid approach (which saturated near 127 whenever
+                       // the slow EMA lagged behind Mike's resting alpha level, pinning
+                       // the trace at max and making the threshold meaningless).
+                       // Tuning: if alpha variation feels too small to cross the threshold,
+                       // raise this (600, 700…); if the signal swings too wildly, lower it.
   deadband: 8,         // ON/OFF hysteresis width around the threshold (0-127 units),
                        // prevents flicker right at the boundary
   readySeconds: 180    // how long the slow EMA needs to run before switching from
@@ -264,10 +267,8 @@ const DRIFT_CONFIG = {
                        // 1-4min wander is real alpha-state signal or artifact before
                        // touching this again.
 };
-let driftFixEnabled = false;   // OFF by default — legacy signal works well in practice;
-                                // Drift Fix saturates while the slow EMA is still below
-                                // Mike's resting alpha. Re-enable via checkbox/Knob2 once
-                                // we tune sigmoidGain and slowSeconds for his signal range.
+let driftFixEnabled = true;    // ON by default — linear scaling (replacing sigmoid) means
+                                // it can no longer pin at max during slow-EMA convergence.
 let driftReady = false;        // true once slow EMA has run >= readySeconds — promoted to
                                 // module level so drawDriftTrackingPlot() can read it
 let driftHandoffTime = null;   // performance.now() when driftReady first became true —
@@ -921,8 +922,11 @@ function draw() {
   fastEMA_alpha += kFast * (alpha_rel - fastEMA_alpha);
   slowEMA_alpha += kSlow * (alpha_rel - slowEMA_alpha);
   const deviationDrift = fastEMA_alpha - slowEMA_alpha;
-  const mixDrift = 1 / (1 + Math.exp(-DRIFT_CONFIG.sigmoidGain * deviationDrift));
-  smoothedAlphaDrift += smoothK * (mixDrift * 127 - smoothedAlphaDrift);
+  // Linear mapping centered at 64: signal = 64 when alpha == slow baseline,
+  // rises above 64 when Mike relaxes (fast > slow), falls below when he focuses.
+  // Clamped 0-127 but only clips at extreme deviations (>0.126 for scale=500).
+  const targetDrift = Math.max(0, Math.min(127, 64 + deviationDrift * DRIFT_CONFIG.linearScale));
+  smoothedAlphaDrift += smoothK * (targetDrift - smoothedAlphaDrift);
 
   // Readiness: has the slow EMA run long enough to be trusted for setting
   // the threshold? Sent to the LED controller so it can show a "still
