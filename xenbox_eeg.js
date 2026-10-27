@@ -268,6 +268,10 @@ const DRIFT_CONFIG = {
 let driftFixEnabled = true;    // ON by default
 let driftReady = false;        // true once slow EMA has run >= readySeconds — promoted to
                                 // module level so drawDriftTrackingPlot() can read it
+let driftHandoffTime = null;   // performance.now() when driftReady first became true —
+                                // used to cross-fade from legacy to drift over
+                                // DRIFT_HANDOFF_FADE_MS so there's no sudden jump at handoff
+const DRIFT_HANDOFF_FADE_MS = 15000;  // 15s blend from legacy → drift at handoff
 let fastEMA_alpha = null;      // null = not yet seeded (seeded from first real sample)
 let slowEMA_alpha = null;
 let driftStartTime = null;     // performance.now() at first seed — for the readiness clock.
@@ -861,6 +865,7 @@ function draw() {
       fastEMA_alpha = null;
       slowEMA_alpha = null;
       driftStartTime = null;
+      driftHandoffTime = null;
       sendAlphaScore(0, false);
     }
   }
@@ -924,15 +929,18 @@ function draw() {
   driftReady = driftStartTime !== null &&
     (performance.now() - driftStartTime) >= DRIFT_CONFIG.readySeconds * 1000;
 
-  // Active tracked signal — whichever the A/B toggle selects. Both are
-  // always computed above regardless, so the drift-tracking plot can show
-  // both traces for comparison no matter which one is driving the effect.
-  // While the slow EMA hasn't converged yet (driftReady false), fall back to
-  // legacy even when Drift Fix is enabled — the slow EMA starts below Mike's
-  // actual alpha baseline, inflating fastEMA-slowEMA and pushing the
-  // drift-corrected value near 127 during warmup. Legacy handles the first
-  // 8 minutes cleanly; Drift Fix takes over once the baseline is settled.
-  smoothedAlpha = (driftFixEnabled && driftReady) ? smoothedAlphaDrift : smoothedAlphaLegacy;
+  // Active tracked signal. During warmup (driftReady false) always use legacy.
+  // At handoff, cross-fade from legacy → drift over DRIFT_HANDOFF_FADE_MS so
+  // there's no sudden jump (the slow EMA still lags the fast one at handoff,
+  // which inflates the drift signal — the fade lets it settle gracefully).
+  if (driftFixEnabled && driftReady) {
+    if (driftHandoffTime === null) driftHandoffTime = performance.now();
+    const fadeT = Math.min(1, (performance.now() - driftHandoffTime) / DRIFT_HANDOFF_FADE_MS);
+    smoothedAlpha = smoothedAlphaLegacy + fadeT * (smoothedAlphaDrift - smoothedAlphaLegacy);
+  } else {
+    driftHandoffTime = null;
+    smoothedAlpha = smoothedAlphaLegacy;
+  }
   rawAlphaMidi = smoothedAlpha;  // 0-127 for histogram display
 
   // Sample both traces into the drift-tracking plot's history once/sec —
