@@ -1321,7 +1321,7 @@ function drawDriftTrackingPlot() {
   textSize(10);
   textAlign(RIGHT, CENTER);
   noStroke(); fill(180, 180, 180);
-  text('Legacy', plotX + plotW - 55, plotY + 22);
+  text('Raw', plotX + plotW - 55, plotY + 22);
   fill(0, 160, 60);
   text('Drift Fix', plotX + plotW - 5, plotY + 22);
   stroke(180, 180, 180); strokeWeight(1);
