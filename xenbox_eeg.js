@@ -1280,71 +1280,84 @@ function drawDriftTrackingPlot() {
   rect(plotX, plotY, plotW, plotH, 3);
   pop();
 
+  // Title + status
   push();
   fill(0);
-  textSize(10);
+  textSize(12);
   textAlign(LEFT, TOP);
-  const activeLabel = (driftFixEnabled && driftReady) ? 'Drift Fix active' : driftFixEnabled ? 'Legacy active (Drift Fix warming up)' : 'Legacy active (Drift Fix OFF)';
-  text(`Drift Tracking (last 5 min) — ${activeLabel}`, plotX + 5, plotY + 2);
+  text('Drift Tracking — last 5 min', plotX + 5, plotY + 3);
   pop();
 
-  // Countdown banner while Drift Fix is enabled but still warming up
-  if (driftFixEnabled && !driftReady && driftStartTime !== null) {
-    const elapsedS = (performance.now() - driftStartTime) / 1000;
-    const remainS = Math.max(0, Math.ceil(DRIFT_CONFIG.readySeconds - elapsedS));
-    const mm = Math.floor(remainS / 60);
-    const ss = String(remainS % 60).padStart(2, '0');
+  // Warmup countdown — large and readable
+  if (driftFixEnabled && !driftReady) {
     push();
-    fill(200, 140, 0);
-    textSize(13);
     textAlign(RIGHT, TOP);
     textStyle(BOLD);
-    text(`Drift Fix warming up — ${mm}:${ss} left`, plotX + plotW - 6, plotY + 2);
+    if (driftStartTime !== null) {
+      const remainS = Math.max(0, Math.ceil(DRIFT_CONFIG.readySeconds - (performance.now() - driftStartTime) / 1000));
+      const mm = Math.floor(remainS / 60);
+      const ss = String(remainS % 60).padStart(2, '0');
+      fill(200, 120, 0);
+      textSize(18);
+      text(`⏳ Warming up: ${mm}:${ss}`, plotX + plotW - 8, plotY + 3);
+    } else {
+      fill(160);
+      textSize(16);
+      text('Waiting for headset…', plotX + plotW - 8, plotY + 3);
+    }
     pop();
-  } else if (driftFixEnabled && !driftReady && driftStartTime === null) {
+  } else if (driftFixEnabled && driftReady) {
     push();
-    fill(150);
-    textSize(11);
+    fill(0, 140, 60);
+    textSize(14);
+    textStyle(BOLD);
     textAlign(RIGHT, TOP);
-    text('Waiting for EEG data to start warmup...', plotX + plotW - 6, plotY + 2);
+    text('✓ Drift Fix active', plotX + plotW - 8, plotY + 3);
     pop();
   }
 
-  // Legend
+  // Legend (compact, right-aligned above inner plot)
   push();
-  textSize(9);
-  textAlign(LEFT, CENTER);
+  textSize(10);
+  textAlign(RIGHT, CENTER);
+  noStroke(); fill(180, 180, 180);
+  text('Legacy', plotX + plotW - 55, plotY + 22);
+  fill(0, 160, 60);
+  text('Drift Fix', plotX + plotW - 5, plotY + 22);
   stroke(180, 180, 180); strokeWeight(1);
-  line(plotX + plotW - 130, plotY + 8, plotX + plotW - 110, plotY + 8);
-  noStroke(); fill(100);
-  text("Legacy", plotX + plotW - 105, plotY + 8);
-  stroke(0, 160, 80); strokeWeight(2);
-  line(plotX + plotW - 60, plotY + 8, plotX + plotW - 40, plotY + 8);
-  noStroke(); fill(0, 120, 60);
-  text("Drift Fix", plotX + plotW - 35, plotY + 8);
+  line(plotX + plotW - 100, plotY + 22, plotX + plotW - 60, plotY + 22);
+  stroke(0, 160, 60); strokeWeight(3);
+  line(plotX + plotW - 48, plotY + 22, plotX + plotW - 12, plotY + 22);
   pop();
 
-  const innerX = plotX + 28;  // reserves room for the value-axis labels below
-  const innerY = plotY + 14;
+  const innerX = plotX + 28;
+  const innerY = plotY + 30;   // extra top margin for the larger status text
   const innerW = plotW - 33;
-  const innerH = plotH - 18;
+  const innerH = plotH - 34;
 
   // Fixed 0-127 scale (same units as the threshold knob) so the threshold
   // line and hysteresis band are stationary reference points on this plot
   const valueToY = (v) => innerY + innerH - (v / 127) * innerH;
 
-  // Gridlines + value labels (0/32/64/96/127) — cheap to add now that there's
-  // real vertical room, and directly useful for judging the trend by eye
+  // Gridlines + value labels
   push();
-  stroke(230);
-  strokeWeight(1);
-  fill(150);
   textSize(9);
   textAlign(RIGHT, CENTER);
   for (const v of [0, 32, 64, 96, 127]) {
     const gy = valueToY(v);
+    if (v === 64) {
+      // 64 = slow EMA baseline in the drift-corrected space — highlight it
+      stroke(100, 160, 255, 120);
+      strokeWeight(1.5);
+      fill(60, 100, 200);
+      text('baseline', innerX - 3, gy);
+    } else {
+      stroke(230);
+      strokeWeight(1);
+      fill(150);
+      text(v, innerX - 3, gy);
+    }
     line(innerX, gy, innerX + innerW, gy);
-    text(v, innerX - 3, gy);
   }
   pop();
 
@@ -1376,26 +1389,24 @@ function drawDriftTrackingPlot() {
     pop();
   };
 
-  // Active trace is whichever is currently driving the effect (same logic as
-  // smoothedAlpha selection above). Bold it and dim the inactive one so it's
-  // obvious which signal is live.
-  const driftIsActive = driftFixEnabled && driftReady;
-  drawTrace(driftHistoryLegacy, driftIsActive ? [210, 210, 210] : [30, 30, 200], driftIsActive ? 1 : 3);
-  drawTrace(driftHistoryDrift,  driftIsActive ? [0, 180, 60]    : [160, 160, 160], driftIsActive ? 3 : 1);
+  // Legacy = always thin gray background reference
+  // Drift Fix = always bold green (what's driving the effect once ready)
+  drawTrace(driftHistoryLegacy, [190, 190, 190], 1);
+  drawTrace(driftHistoryDrift,  [0, 180, 60],    3);
 
-  // Dot at the right edge of each trace showing its current live value
-  const addTip = (history, col) => {
+  // Dot at the right edge showing current live value
+  const addTip = (history, col, size) => {
     if (history.length < 1) return;
     push();
     noStroke();
     fill(...col);
     const tipX = innerX + ((history.length - 1) / (DRIFT_HISTORY_LENGTH - 1)) * innerW;
     const tipY = valueToY(history[history.length - 1]);
-    ellipse(tipX, tipY, 7, 7);
+    ellipse(tipX, tipY, size, size);
     pop();
   };
-  addTip(driftHistoryLegacy, driftIsActive ? [180, 180, 180] : [30, 30, 200]);
-  addTip(driftHistoryDrift,  driftIsActive ? [0, 180, 60]    : [140, 140, 140]);
+  addTip(driftHistoryLegacy, [160, 160, 160], 5);
+  addTip(driftHistoryDrift,  [0, 180, 60],    9);
 
   if (driftHistoryLegacy.length < 2) {
     push();
