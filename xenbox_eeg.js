@@ -922,7 +922,12 @@ function draw() {
   // Active tracked signal — whichever the A/B toggle selects. Both are
   // always computed above regardless, so the drift-tracking plot can show
   // both traces for comparison no matter which one is driving the effect.
-  smoothedAlpha = driftFixEnabled ? smoothedAlphaDrift : smoothedAlphaLegacy;
+  // While the slow EMA hasn't converged yet (driftReady false), fall back to
+  // legacy even when Drift Fix is enabled — the slow EMA starts below Mike's
+  // actual alpha baseline, inflating fastEMA-slowEMA and pushing the
+  // drift-corrected value near 127 during warmup. Legacy handles the first
+  // 8 minutes cleanly; Drift Fix takes over once the baseline is settled.
+  smoothedAlpha = (driftFixEnabled && driftReady) ? smoothedAlphaDrift : smoothedAlphaLegacy;
   rawAlphaMidi = smoothedAlpha;  // 0-127 for histogram display
 
   // Sample both traces into the drift-tracking plot's history once/sec —
@@ -1260,7 +1265,8 @@ function drawDriftTrackingPlot() {
   fill(0);
   textSize(10);
   textAlign(LEFT, TOP);
-  text(`Drift Tracking (last 5 min) — ${driftFixEnabled ? 'Drift Fix ON' : 'Drift Fix OFF, legacy active'}`, plotX + 5, plotY + 2);
+  const activeLabel = (driftFixEnabled && driftReady) ? 'Drift Fix active' : driftFixEnabled ? 'Legacy active (Drift Fix warming up)' : 'Legacy active (Drift Fix OFF)';
+  text(`Drift Tracking (last 5 min) — ${activeLabel}`, plotX + 5, plotY + 2);
   pop();
 
   // Legend
@@ -1329,8 +1335,26 @@ function drawDriftTrackingPlot() {
     pop();
   };
 
-  drawTrace(driftHistoryLegacy, [180, 180, 180], 1);   // light gray, thin — legacy
-  drawTrace(driftHistoryDrift, [0, 160, 80], 2);        // bold green — Drift Fix
+  // Active trace is whichever is currently driving the effect (same logic as
+  // smoothedAlpha selection above). Bold it and dim the inactive one so it's
+  // obvious which signal is live.
+  const driftIsActive = driftFixEnabled && driftReady;
+  drawTrace(driftHistoryLegacy, driftIsActive ? [210, 210, 210] : [30, 30, 200], driftIsActive ? 1 : 3);
+  drawTrace(driftHistoryDrift,  driftIsActive ? [0, 180, 60]    : [160, 160, 160], driftIsActive ? 3 : 1);
+
+  // Dot at the right edge of each trace showing its current live value
+  const addTip = (history, col) => {
+    if (history.length < 1) return;
+    push();
+    noStroke();
+    fill(...col);
+    const tipX = innerX + ((history.length - 1) / (DRIFT_HISTORY_LENGTH - 1)) * innerW;
+    const tipY = valueToY(history[history.length - 1]);
+    ellipse(tipX, tipY, 7, 7);
+    pop();
+  };
+  addTip(driftHistoryLegacy, driftIsActive ? [180, 180, 180] : [30, 30, 200]);
+  addTip(driftHistoryDrift,  driftIsActive ? [0, 180, 60]    : [140, 140, 140]);
 
   if (driftHistoryLegacy.length < 2) {
     push();
